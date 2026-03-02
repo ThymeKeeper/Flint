@@ -167,11 +167,10 @@ async fn run_reflection(
             info!("Stored reflection memory");
 
             if let Some(msg) = &proactive_message {
-                if let Some(contact) = config.signal.allowed_senders.first() {
-                    info!("Sending proactive message to {contact}");
-                    if let Err(e) = signal.send(contact, msg).await {
-                        error!("Failed to send proactive message: {e:#}");
-                    }
+                let contact = &config.primary_contact;
+                info!("Sending proactive message to {contact}");
+                if let Err(e) = signal.send(contact, msg).await {
+                    error!("Failed to send proactive message: {e:#}");
                 }
             }
 
@@ -285,6 +284,8 @@ mod tests {
                 kind: MemoryKind::Episodic,
                 importance: 0.8,
                 similarity: 1.0,
+                pinned: false,
+                created_at: chrono::Utc::now(),
             },
             MemoryRef {
                 id: "b".to_string(),
@@ -292,6 +293,8 @@ mod tests {
                 kind: MemoryKind::Semantic,
                 importance: 0.9,
                 similarity: 1.0,
+                pinned: false,
+                created_at: chrono::Utc::now(),
             },
         ];
         let result = format_memories_for_reflection(&mems);

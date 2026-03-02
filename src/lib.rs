@@ -5,5 +5,7 @@ pub mod context;
 pub mod embeddings;
 pub mod heartbeat;
 pub mod memory;
+pub mod setup;
 pub mod signal;
 pub mod tools;
+pub mod tui;

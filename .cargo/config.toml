@@ -1,0 +1,5 @@
+# Linker config — install lld for faster linking:
+#   sudo apt install lld
+# then uncomment:
+# [target.x86_64-unknown-linux-gnu]
+# rustflags = ["-C", "link-arg=-fuse-ld=lld"]

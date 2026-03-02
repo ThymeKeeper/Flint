@@ -7,6 +7,7 @@ use tokio::time::timeout;
 use crate::claude::{
     ApiMessage, ClaudeRequest, ContentBlock, LlmClient, MessageContent, ToolDefinition,
 };
+use crate::memory::MemoryManager;
 
 pub fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
@@ -213,6 +214,76 @@ fn is_system_path(path: &str) -> bool {
 // ToolExecutor
 // ---------------------------------------------------------------------------
 
+fn memory_tool_definitions() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: "memory_search",
+            description: "Search your long-term memory by semantic query. Returns a JSON array \
+                of matching memories with their IDs, content, kind, importance, pinned status, \
+                and creation date. Use this to find outdated memories before updating or deleting them.",
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural-language search query"
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "description": "Maximum number of results to return (default: 5)"
+                    }
+                },
+                "required": ["query"]
+            }),
+        },
+        ToolDefinition {
+            name: "memory_update",
+            description: "Update an existing memory by ID. You can change its content \
+                (the embedding is automatically recomputed), adjust its importance, or \
+                pin/unpin it. Use this when a memory is stale but the topic is still relevant — \
+                e.g. a server IP address changed, or a preference has shifted.",
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "The memory ID (from memory_search)"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "New content to replace the existing content"
+                    },
+                    "importance": {
+                        "type": "number",
+                        "description": "New importance score between 0 and 1"
+                    },
+                    "pinned": {
+                        "type": "boolean",
+                        "description": "Pin (true) or unpin (false) the memory"
+                    }
+                },
+                "required": ["id"]
+            }),
+        },
+        ToolDefinition {
+            name: "memory_delete",
+            description: "Permanently delete a memory by ID. Use this when information is \
+                fully obsolete and should not be recalled — e.g. a server that no longer exists, \
+                a preference that is no longer valid, or a one-off fact that is no longer true.",
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "The memory ID to delete (from memory_search)"
+                    }
+                },
+                "required": ["id"]
+            }),
+        },
+    ]
+}
+
 fn spawn_subagent_definition() -> ToolDefinition {
     ToolDefinition {
         name: "spawn_subagent",
@@ -241,25 +312,97 @@ fn spawn_subagent_definition() -> ToolDefinition {
 
 pub struct ToolExecutor {
     llm:        Arc<dyn LlmClient>,
+    memory:     Arc<MemoryManager>,
     max_tokens: usize,
 }
 
 impl ToolExecutor {
-    pub fn new(llm: Arc<dyn LlmClient>, max_tokens: usize) -> Self {
-        Self { llm, max_tokens }
+    pub fn new(llm: Arc<dyn LlmClient>, memory: Arc<MemoryManager>, max_tokens: usize) -> Self {
+        Self { llm, memory, max_tokens }
     }
 
-    /// Returns the 4 base tools plus spawn_subagent (5 total).
+    /// Returns the 4 base tools plus memory tools and spawn_subagent (8 total).
     pub fn tool_definitions(&self) -> Vec<ToolDefinition> {
         let mut defs = tool_definitions();
+        defs.extend(memory_tool_definitions());
         defs.push(spawn_subagent_definition());
         defs
     }
 
     pub async fn execute(&self, name: &str, input: &Value) -> String {
         match name {
+            "memory_search" => self.memory_search(input).await,
+            "memory_update" => self.memory_update(input).await,
+            "memory_delete" => self.memory_delete(input).await,
             "spawn_subagent" => self.spawn_subagent(input).await,
             _ => execute_tool(name, input).await,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Memory tool implementations
+    // -----------------------------------------------------------------------
+
+    async fn memory_search(&self, input: &Value) -> String {
+        let query = match input["query"].as_str() {
+            Some(q) => q,
+            None => return "Error: missing 'query' field".to_string(),
+        };
+        let top_k = input["top_k"].as_u64().map(|n| n as usize);
+
+        match self.memory.search(query, top_k).await {
+            Err(e) => format!("Error searching memories: {e:#}"),
+            Ok(refs) => {
+                if refs.is_empty() {
+                    return "[]".to_string();
+                }
+                let items: Vec<serde_json::Value> = refs
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "id": r.id,
+                            "content": r.content,
+                            "kind": r.kind.as_str(),
+                            "importance": r.importance,
+                            "pinned": r.pinned,
+                            "created_at": r.created_at.to_rfc3339(),
+                            "similarity": r.similarity,
+                        })
+                    })
+                    .collect();
+                serde_json::to_string_pretty(&items).unwrap_or_else(|_| "[]".to_string())
+            }
+        }
+    }
+
+    async fn memory_update(&self, input: &Value) -> String {
+        let id = match input["id"].as_str() {
+            Some(i) => i,
+            None => return "Error: missing 'id' field".to_string(),
+        };
+        let new_content = input["content"].as_str();
+        let new_importance = input["importance"].as_f64();
+        let new_pinned = input["pinned"].as_bool();
+
+        if new_content.is_none() && new_importance.is_none() && new_pinned.is_none() {
+            return "Error: at least one of 'content', 'importance', or 'pinned' must be provided".to_string();
+        }
+
+        match self.memory.update(id, new_content, new_importance, new_pinned).await {
+            Err(e) => format!("Error updating memory: {e:#}"),
+            Ok(false) => format!("Error: no memory found with id '{id}'"),
+            Ok(true) => format!("Memory '{id}' updated successfully"),
+        }
+    }
+
+    async fn memory_delete(&self, input: &Value) -> String {
+        let id = match input["id"].as_str() {
+            Some(i) => i,
+            None => return "Error: missing 'id' field".to_string(),
+        };
+        match self.memory.delete(&[id.to_string()]).await {
+            Err(e) => format!("Error deleting memory: {e:#}"),
+            Ok(()) => format!("Memory '{id}' deleted"),
         }
     }
 
@@ -415,22 +558,59 @@ mod tests {
         assert!(result.starts_with("Error reading file"));
     }
 
-    #[test]
-    fn test_executor_includes_spawn_subagent() {
+    async fn test_executor() -> ToolExecutor {
         use crate::claude::mock::MockLlm;
+        use crate::config::MemoryConfig;
+        use crate::embeddings::mock::MockEmbeddingClient;
+        use std::path::Path;
         let llm = Arc::new(MockLlm::new(vec![]));
-        let executor = ToolExecutor::new(llm, 1000);
+        let embedder = Arc::new(MockEmbeddingClient::new(4));
+        let memory = Arc::new(
+            MemoryManager::new(Path::new(":memory:"), embedder, MemoryConfig {
+                max_memories: 100,
+                top_k_retrieval: 5,
+                importance_decay_days: 30.0,
+                min_importance_to_keep: 0.1,
+                ttl_days_episodic: 90.0,
+            }, 4)
+            .await
+            .unwrap(),
+        );
+        ToolExecutor::new(llm, memory, 1000)
+    }
+
+    #[tokio::test]
+    async fn test_executor_includes_spawn_subagent() {
+        let executor = test_executor().await;
         let defs = executor.tool_definitions();
-        assert_eq!(defs.len(), 5);
+        assert_eq!(defs.len(), 8);
         let names: Vec<_> = defs.iter().map(|d| d.name).collect();
         assert!(names.contains(&"spawn_subagent"));
+        assert!(names.contains(&"memory_search"));
+        assert!(names.contains(&"memory_update"));
+        assert!(names.contains(&"memory_delete"));
     }
 
     #[tokio::test]
     async fn test_spawn_subagent_returns_mock_text() {
         use crate::claude::mock::MockLlm;
+        use crate::config::MemoryConfig;
+        use crate::embeddings::mock::MockEmbeddingClient;
+        use std::path::Path;
         let llm = Arc::new(MockLlm::new(vec!["sub-agent result".to_string()]));
-        let executor = ToolExecutor::new(llm, 1000);
+        let embedder = Arc::new(MockEmbeddingClient::new(4));
+        let memory = Arc::new(
+            MemoryManager::new(Path::new(":memory:"), embedder, MemoryConfig {
+                max_memories: 100,
+                top_k_retrieval: 5,
+                importance_decay_days: 30.0,
+                min_importance_to_keep: 0.1,
+                ttl_days_episodic: 90.0,
+            }, 4)
+            .await
+            .unwrap(),
+        );
+        let executor = ToolExecutor::new(llm, memory, 1000);
         let input = serde_json::json!({"task": "summarise /etc/hostname"});
         let result = executor.execute("spawn_subagent", &input).await;
         assert_eq!(result, "sub-agent result");
@@ -438,11 +618,34 @@ mod tests {
 
     #[tokio::test]
     async fn test_spawn_subagent_missing_task() {
-        use crate::claude::mock::MockLlm;
-        let llm = Arc::new(MockLlm::new(vec![]));
-        let executor = ToolExecutor::new(llm, 1000);
+        let executor = test_executor().await;
         let input = serde_json::json!({});
         let result = executor.execute("spawn_subagent", &input).await;
         assert_eq!(result, "Error: missing 'task' field");
+    }
+
+    #[tokio::test]
+    async fn test_memory_search_empty() {
+        let executor = test_executor().await;
+        let input = serde_json::json!({"query": "home server"});
+        let result = executor.execute("memory_search", &input).await;
+        assert_eq!(result, "[]");
+    }
+
+    #[tokio::test]
+    async fn test_memory_update_missing_id() {
+        let executor = test_executor().await;
+        let input = serde_json::json!({"content": "new content"});
+        let result = executor.execute("memory_update", &input).await;
+        assert!(result.contains("missing 'id'"));
+    }
+
+    #[tokio::test]
+    async fn test_memory_delete_unknown_id() {
+        let executor = test_executor().await;
+        let input = serde_json::json!({"id": "nonexistent-id"});
+        // delete on a non-existent row is a no-op (returns ok)
+        let result = executor.execute("memory_delete", &input).await;
+        assert!(result.contains("deleted"));
     }
 }

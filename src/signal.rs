@@ -1,9 +1,21 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tracing::{debug, warn};
 
-use crate::config::SignalConfig;
+// ---------------------------------------------------------------------------
+// SignalConfig — kept here (no longer part of AppConfig)
+// ---------------------------------------------------------------------------
+
+/// Configuration for the signal-cli REST backend (kept for future use).
+#[derive(Debug, Clone)]
+pub struct SignalConfig {
+    pub base_url: String,
+    pub phone_number: String,
+    pub allowed_senders: Vec<String>,
+    pub poll_interval_secs: u64,
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -29,6 +41,13 @@ pub trait SignalClient: Send + Sync {
     async fn send(&self, recipient: &str, message: &str) -> Result<()>;
     /// Check if a sender is in the allow list.
     fn is_allowed(&self, sender: &str) -> bool;
+    /// Return a streaming text callback if this transport supports it.
+    /// Called for each text chunk as Claude generates it.
+    /// When Some is returned, `send()` must be a no-op (text was already printed).
+    /// Default: None (non-streaming transports like Signal REST).
+    fn text_stream_callback(&self) -> Option<Arc<dyn Fn(String) + Send + Sync>> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -232,6 +251,64 @@ pub mod mock {
         fn is_allowed(&self, sender: &str) -> bool {
             self.allowed.iter().any(|s| s == sender)
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TuiSignalClient — bridges the async main loop to the TUI thread
+// ---------------------------------------------------------------------------
+
+/// A [`SignalClient`] backed by the ratatui TUI.
+///
+/// `receive()` awaits user input submitted via the TUI input box.
+/// `send()` delivers the completed response to the TUI for display.
+/// The streaming callback forwards chunks to the TUI in real time.
+pub struct TuiSignalClient {
+    user_input_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<String>>>,
+    agent_update_tx: tokio::sync::mpsc::Sender<crate::tui::AgentUpdate>,
+}
+
+impl TuiSignalClient {
+    pub fn new(channels: crate::tui::TuiChannels) -> Self {
+        Self {
+            user_input_rx: Arc::new(tokio::sync::Mutex::new(channels.user_input_rx)),
+            agent_update_tx: channels.agent_update_tx,
+        }
+    }
+}
+
+#[async_trait]
+impl SignalClient for TuiSignalClient {
+    async fn receive(&self) -> Result<Vec<IncomingMessage>> {
+        let mut rx = self.user_input_rx.lock().await;
+        match rx.recv().await {
+            Some(text) => Ok(vec![IncomingMessage {
+                sender: "user".to_string(),
+                text,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }]),
+            None => Err(anyhow!("TUI input channel closed")),
+        }
+    }
+
+    async fn send(&self, _recipient: &str, message: &str) -> Result<()> {
+        self.agent_update_tx
+            .send(crate::tui::AgentUpdate::Complete(message.to_string()))
+            .await
+            .ok();
+        Ok(())
+    }
+
+    fn is_allowed(&self, _sender: &str) -> bool {
+        true
+    }
+
+    fn text_stream_callback(&self) -> Option<Arc<dyn Fn(String) + Send + Sync>> {
+        let tx = self.agent_update_tx.clone();
+        Some(Arc::new(move |chunk: String| {
+            // try_send is non-blocking and safe to call from an async context.
+            let _ = tx.try_send(crate::tui::AgentUpdate::StreamChunk(chunk));
+        }))
     }
 }
 

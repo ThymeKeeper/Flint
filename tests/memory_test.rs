@@ -1,19 +1,14 @@
-// Integration tests for MemoryManager backed by Qdrant.
-//
-// These tests require a running Qdrant instance:
-//   docker run -p 6334:6334 qdrant/qdrant
-//
-// They are marked #[ignore] by default so `cargo test` skips them.
-// Run with: cargo test -- --ignored
-//
-// Or set QDRANT_URL to point at your instance:
-//   QDRANT_URL=http://localhost:6334 cargo test -- --ignored
+// Integration tests for MemoryManager — run against an in-memory DuckDB
+// database with no external services required.
 
+use std::path::Path;
 use std::sync::Arc;
 
-use clawd::config::{MemoryConfig, QdrantConfig};
+use clawd::config::MemoryConfig;
 use clawd::embeddings::mock::MockEmbeddingClient;
 use clawd::memory::{MemoryKind, MemoryManager, MemoryRef};
+
+const DIM: usize = 4; // tiny dimension so tests run fast
 
 fn test_memory_config() -> MemoryConfig {
     MemoryConfig {
@@ -25,49 +20,38 @@ fn test_memory_config() -> MemoryConfig {
     }
 }
 
-fn qdrant_config() -> QdrantConfig {
-    QdrantConfig {
-        url: std::env::var("QDRANT_URL")
-            .unwrap_or_else(|_| "http://localhost:6334".to_string()),
-        // Use a unique collection per test run to avoid collisions
-        collection: format!(
-            "test_memories_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis()
-        ),
-    }
+async fn make_manager() -> MemoryManager {
+    let embedder = Arc::new(MockEmbeddingClient::new(DIM));
+    MemoryManager::new(Path::new(":memory:"), embedder, test_memory_config(), DIM)
+        .await
+        .unwrap()
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_store_and_search_roundtrip() {
-    let embedder = Arc::new(MockEmbeddingClient::new(1024));
-    let manager =
-        MemoryManager::new(qdrant_config(), embedder, test_memory_config())
-            .await
-            .unwrap();
+    let manager = make_manager().await;
 
     let id = manager
-        .store("The user prefers Rust over Python", MemoryKind::Semantic, "test", 0.8)
+        .store(
+            "The user prefers Rust over Python",
+            MemoryKind::Semantic,
+            "test",
+            0.8,
+        )
         .await
         .unwrap();
     assert!(!id.is_empty());
 
     let results = manager.search("Rust programming", Some(5)).await.unwrap();
     assert!(!results.is_empty());
-    assert!(results.iter().any(|r| r.content == "The user prefers Rust over Python"));
+    assert!(results
+        .iter()
+        .any(|r| r.content == "The user prefers Rust over Python"));
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_count_and_delete() {
-    let embedder = Arc::new(MockEmbeddingClient::new(1024));
-    let manager =
-        MemoryManager::new(qdrant_config(), embedder, test_memory_config())
-            .await
-            .unwrap();
+    let manager = make_manager().await;
 
     let id = manager
         .store("To be deleted", MemoryKind::Episodic, "test", 0.5)
@@ -80,30 +64,19 @@ async fn test_count_and_delete() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_mark_accessed() {
-    let embedder = Arc::new(MockEmbeddingClient::new(1024));
-    let manager =
-        MemoryManager::new(qdrant_config(), embedder, test_memory_config())
-            .await
-            .unwrap();
+    let manager = make_manager().await;
 
     let id = manager
         .store("Test memory", MemoryKind::Episodic, "test", 0.5)
         .await
         .unwrap();
-    // Should not error
     manager.mark_accessed(&[id]).await.unwrap();
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_recent() {
-    let embedder = Arc::new(MockEmbeddingClient::new(1024));
-    let manager =
-        MemoryManager::new(qdrant_config(), embedder, test_memory_config())
-            .await
-            .unwrap();
+    let manager = make_manager().await;
 
     for i in 0..5 {
         manager
@@ -117,20 +90,11 @@ async fn test_recent() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_find_episodic_clusters_empty() {
-    let embedder = Arc::new(MockEmbeddingClient::new(1024));
-    let manager =
-        MemoryManager::new(qdrant_config(), embedder, test_memory_config())
-            .await
-            .unwrap();
+    let manager = make_manager().await;
     let clusters = manager.find_episodic_clusters().await.unwrap();
     assert!(clusters.is_empty());
 }
-
-// ---------------------------------------------------------------------------
-// Unit tests (no network — testing pure logic)
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_format_memories_for_prompt() {
@@ -140,6 +104,8 @@ fn test_format_memories_for_prompt() {
         kind: MemoryKind::Semantic,
         importance: 0.9,
         similarity: 0.85,
+        pinned: false,
+        created_at: chrono::Utc::now(),
     }];
     let formatted = MemoryManager::format_memories_for_prompt(&memories);
     assert!(formatted.contains("User likes tea"));

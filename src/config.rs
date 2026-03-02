@@ -10,21 +10,27 @@ use tracing::{error, info, warn};
 // AppConfig — loaded from config.toml
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct AppConfig {
-    pub soul_path: String,
-    pub claude: ClaudeConfig,
-    pub voyage: VoyageConfig,
-    pub signal: SignalConfig,
-    pub memory: MemoryConfig,
-    pub heartbeat: HeartbeatConfig,
-    pub qdrant: QdrantConfig,
+fn default_primary_contact() -> String {
+    "user".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct QdrantConfig {
-    pub url: String,
-    pub collection: String,
+pub struct AppConfig {
+    /// Path to soul.yaml (agent personality file).
+    pub soul_path: String,
+    /// Path to the DuckDB memories database file.
+    pub db_path: String,
+    /// Who to send proactive heartbeat messages to. Default: "user" (stdio mode).
+    #[serde(default = "default_primary_contact")]
+    pub primary_contact: String,
+    /// Anthropic API key. If omitted, falls back to ANTHROPIC_API_KEY env var.
+    pub anthropic_api_key: Option<String>,
+    pub claude: ClaudeConfig,
+    pub memory: MemoryConfig,
+    pub heartbeat: HeartbeatConfig,
+    /// Seconds to sleep between signal polls. 0 = stdio blocking mode.
+    #[serde(default)]
+    pub poll_interval_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -33,20 +39,6 @@ pub struct ClaudeConfig {
     pub max_tokens: usize,
     pub context_limit: usize,
     pub compaction_threshold: f64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct VoyageConfig {
-    pub model: String,
-    pub dimensions: usize,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct SignalConfig {
-    pub base_url: String,
-    pub phone_number: String,
-    pub allowed_senders: Vec<String>,
-    pub poll_interval_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -67,10 +59,16 @@ impl AppConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
-        let config: AppConfig =
-            toml::from_str(&text).with_context(|| "Failed to parse config.toml")?;
-        Ok(config)
+        toml::from_str(&text).with_context(|| "Failed to parse config.toml")
     }
+
+    /// Resolve Anthropic API key: env var takes priority over config file.
+    pub fn resolve_anthropic_key(&self) -> Option<String> {
+        std::env::var("ANTHROPIC_API_KEY")
+            .ok()
+            .or_else(|| self.anthropic_api_key.clone())
+    }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -91,9 +89,7 @@ impl Soul {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read soul file: {}", path.display()))?;
-        let soul: Soul =
-            serde_yaml::from_str(&text).with_context(|| "Failed to parse soul.yaml")?;
-        Ok(soul)
+        serde_yaml::from_str(&text).with_context(|| "Failed to parse soul.yaml")
     }
 
     pub fn to_system_prompt(&self) -> String {
@@ -122,9 +118,6 @@ impl Soul {
 // Soul hot-reload watcher
 // ---------------------------------------------------------------------------
 
-/// Spawns a background task that watches `soul_path` for changes and reloads
-/// the soul into the provided `Arc<RwLock<Soul>>`. Returns the watcher handle
-/// which must be kept alive for the duration of the program.
 pub fn spawn_soul_watcher(
     soul_path: PathBuf,
     soul: Arc<RwLock<Soul>>,
@@ -136,37 +129,22 @@ pub fn spawn_soul_watcher(
         notify::recommended_watcher(move |res: std::result::Result<Event, notify::Error>| {
             match res {
                 Ok(event) => {
-                    let dominated_by_modify = matches!(
-                        event.kind,
-                        EventKind::Modify(_) | EventKind::Create(_)
-                    );
-                    if dominated_by_modify {
+                    if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
                         info!("Soul file changed, reloading...");
                         match Soul::load(&reload_path) {
                             Ok(new_soul) => {
-                                // We are in a sync callback so we use blocking write.
-                                // The RwLock is tokio's, but blocking_write works from
-                                // sync contexts.
-                                let mut guard = reload_soul.blocking_write();
-                                *guard = new_soul;
+                                *reload_soul.blocking_write() = new_soul;
                                 info!("Soul reloaded successfully");
                             }
-                            Err(e) => {
-                                warn!("Failed to reload soul: {e:#}");
-                            }
+                            Err(e) => warn!("Failed to reload soul: {e:#}"),
                         }
                     }
                 }
-                Err(e) => {
-                    error!("Soul watcher error: {e}");
-                }
+                Err(e) => error!("Soul watcher error: {e}"),
             }
         })?;
 
-    // Watch the parent directory (works better across editors that do atomic saves)
-    let watch_dir = soul_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."));
+    let watch_dir = soul_path.parent().unwrap_or_else(|| Path::new("."));
     watcher.watch(watch_dir, RecursiveMode::NonRecursive)?;
     info!("Watching soul file at {}", soul_path.display());
 
@@ -210,22 +188,14 @@ heartbeat_prompt: "Reflect."
     fn test_config_load() {
         let toml_str = r#"
 soul_path = "/tmp/soul.yaml"
+db_path = "/tmp/test_memories.duckdb"
+primary_contact = "user"
 
 [claude]
 model = "claude-opus-4-6"
 max_tokens = 4096
 context_limit = 200000
 compaction_threshold = 0.75
-
-[voyage]
-model = "voyage-3"
-dimensions = 1024
-
-[signal]
-base_url = "http://localhost:8080"
-phone_number = "+15551234567"
-allowed_senders = ["+15559876543"]
-poll_interval_secs = 5
 
 [memory]
 max_memories = 10000
@@ -236,16 +206,11 @@ ttl_days_episodic = 90
 
 [heartbeat]
 interval_secs = 3600
-
-[qdrant]
-url = "http://localhost:6334"
-collection = "memories"
 "#;
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(toml_str.as_bytes()).unwrap();
         let config = AppConfig::load(f.path()).unwrap();
         assert_eq!(config.claude.model, "claude-opus-4-6");
-        assert_eq!(config.voyage.dimensions, 1024);
-        assert_eq!(config.signal.allowed_senders.len(), 1);
+        assert_eq!(config.primary_contact, "user");
     }
 }

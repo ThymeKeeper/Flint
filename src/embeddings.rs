@@ -1,9 +1,11 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use fastembed::{InitOptionsUserDefined, TextEmbedding, TokenizerFiles, UserDefinedEmbeddingModel};
+use std::sync::Mutex;
 use tracing::debug;
 
-use crate::config::VoyageConfig;
+/// Output dimension of the bundled BGE-small-en-v1.5 model.
+pub const EMBEDDING_DIM: usize = 384;
 
 // ---------------------------------------------------------------------------
 // Trait for testability
@@ -16,105 +18,80 @@ pub trait EmbeddingClient: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
-// Voyage AI client
+// LocalEmbeddingClient — bundled BGE-small-en-v1.5-Q (no API key needed)
 // ---------------------------------------------------------------------------
 
-pub struct VoyageClient {
-    api_key: String,
-    model: String,
-    dimensions: usize,
-    http: reqwest::Client,
+/// Runs the quantized BGE-small-en-v1.5 ONNX model in-process.
+/// Model bytes are compiled into the binary at build time via `include_bytes!`.
+pub struct LocalEmbeddingClient {
+    model: Mutex<TextEmbedding>,
 }
 
-impl VoyageClient {
-    pub fn new(api_key: String, config: &VoyageConfig) -> Self {
-        Self {
-            api_key,
-            model: config.model.clone(),
-            dimensions: config.dimensions,
-            http: reqwest::Client::new(),
-        }
+impl LocalEmbeddingClient {
+    /// Load the model from the directory baked in at compile time by build.rs.
+    pub fn new() -> Result<Self> {
+        let dir = std::path::PathBuf::from(env!("CLAWD_MODELS_DIR"));
+        Self::from_dir(&dir)
     }
-}
 
-#[derive(Serialize)]
-struct VoyageRequest {
-    input: Vec<String>,
-    model: String,
-    output_dimension: usize,
-}
+    /// Load the model from an explicit directory (useful for tests / custom installs).
+    pub fn from_dir(dir: &std::path::Path) -> Result<Self> {
+        let read = |name: &str| -> Result<Vec<u8>> {
+            std::fs::read(dir.join(name)).with_context(|| {
+                format!(
+                    "Embedding model file '{}' not found in {}. \
+                     Run `cargo build` to download it.",
+                    name,
+                    dir.display()
+                )
+            })
+        };
 
-#[derive(Deserialize)]
-struct VoyageResponse {
-    data: Vec<VoyageEmbedding>,
-}
+        let user_model = UserDefinedEmbeddingModel::new(
+            read("model.onnx")?,
+            TokenizerFiles {
+                tokenizer_file: read("tokenizer.json")?,
+                config_file: read("config.json")?,
+                special_tokens_map_file: read("special_tokens_map.json")?,
+                tokenizer_config_file: read("tokenizer_config.json")?,
+            },
+        );
 
-#[derive(Deserialize)]
-struct VoyageEmbedding {
-    embedding: Vec<f32>,
+        let embedding =
+            TextEmbedding::try_new_from_user_defined(user_model, InitOptionsUserDefined::new())
+                .context("Failed to initialize local embedding model")?;
+
+        Ok(Self {
+            model: Mutex::new(embedding),
+        })
+    }
 }
 
 #[async_trait]
-impl EmbeddingClient for VoyageClient {
+impl EmbeddingClient for LocalEmbeddingClient {
     async fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        let results = self.embed_batch(&[text.to_string()]).await?;
-        results
-            .into_iter()
-            .next()
-            .context("Empty response from Voyage AI")
+        debug!("Embedding text locally ({} chars)", text.len());
+        let mut results = self
+            .model
+            .lock()
+            .unwrap()
+            .embed(vec![text.to_string()], None)
+            .context("Local embedding failed")?;
+        results.pop().context("Empty embedding result")
     }
 
     async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        if texts.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        debug!("Embedding {} texts via Voyage AI", texts.len());
-
-        let request = VoyageRequest {
-            input: texts.to_vec(),
-            model: self.model.clone(),
-            output_dimension: self.dimensions,
-        };
-
-        let response = self
-            .http
-            .post("https://api.voyageai.com/v1/embeddings")
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&request)
-            .send()
-            .await
-            .context("Failed to send request to Voyage AI")?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "no body".to_string());
-            bail!("Voyage AI returned {status}: {body}");
-        }
-
-        let voyage_resp: VoyageResponse = response
-            .json()
-            .await
-            .context("Failed to parse Voyage AI response")?;
-
-        let embeddings: Vec<Vec<f32>> = voyage_resp.data.into_iter().map(|e| e.embedding).collect();
-
-        debug!(
-            "Received {} embeddings (dim={})",
-            embeddings.len(),
-            embeddings.first().map(|e| e.len()).unwrap_or(0)
-        );
-
-        Ok(embeddings)
+        debug!("Embedding {} texts locally", texts.len());
+        self.model
+            .lock()
+            .unwrap()
+            .embed(texts.to_vec(), None)
+            .context("Local batch embedding failed")
     }
 }
 
 // ---------------------------------------------------------------------------
-// Cosine similarity (used by memory.rs for in-process clustering)
+// Cosine similarity (used by memory.rs for in-process search)
 // ---------------------------------------------------------------------------
 
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
@@ -143,8 +120,8 @@ pub mod mock {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// A mock embedding client that returns deterministic vectors.
-    /// Each call returns a unique vector based on a hash of the input text.
+    /// Returns deterministic vectors based on input text hash.  Used in tests
+    /// so the real model is not needed.
     pub struct MockEmbeddingClient {
         pub dimensions: usize,
         pub call_count: AtomicUsize,
@@ -160,12 +137,10 @@ pub mod mock {
 
         fn text_to_embedding(&self, text: &str) -> Vec<f32> {
             let mut emb = vec![0.0f32; self.dimensions];
-            // Simple deterministic hash-based embedding
             for (i, byte) in text.bytes().enumerate() {
                 let idx = i % self.dimensions;
                 emb[idx] += (byte as f32) / 255.0;
             }
-            // Normalize
             let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
             if norm > 0.0 {
                 for v in &mut emb {
@@ -197,16 +172,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_mock_embedding_deterministic() {
-        let client = MockEmbeddingClient::new(1024);
+        let client = MockEmbeddingClient::new(EMBEDDING_DIM);
         let e1 = client.embed("hello").await.unwrap();
         let e2 = client.embed("hello").await.unwrap();
         assert_eq!(e1, e2);
-        assert_eq!(e1.len(), 1024);
+        assert_eq!(e1.len(), EMBEDDING_DIM);
     }
 
     #[tokio::test]
     async fn test_mock_embedding_different_texts() {
-        let client = MockEmbeddingClient::new(1024);
+        let client = MockEmbeddingClient::new(EMBEDDING_DIM);
         let e1 = client.embed("hello").await.unwrap();
         let e2 = client.embed("world").await.unwrap();
         assert_ne!(e1, e2);
@@ -214,7 +189,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mock_embedding_normalized() {
-        let client = MockEmbeddingClient::new(1024);
+        let client = MockEmbeddingClient::new(EMBEDDING_DIM);
         let e = client.embed("test text").await.unwrap();
         let norm: f32 = e.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 0.01);

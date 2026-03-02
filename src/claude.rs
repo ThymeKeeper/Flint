@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tracing::{debug, trace};
 
 use crate::config::ClaudeConfig;
@@ -88,12 +89,25 @@ pub struct LlmResponse {
 
 #[async_trait]
 pub trait LlmClient: Send + Sync {
-    /// Full response including tool calls.
+    /// Full response including tool calls (non-streaming).
     async fn complete_with_tools(&self, req: ClaudeRequest<'_>) -> Result<LlmResponse>;
 
     /// Convenience wrapper: returns only the text, ignoring tool calls.
     async fn complete(&self, req: ClaudeRequest<'_>) -> Result<String> {
         self.complete_with_tools(req).await.map(|r| r.text)
+    }
+
+    /// Streaming variant: calls `on_text` for each text delta as it arrives.
+    /// Text that arrives before any tool_use block is streamed; text in rounds
+    /// where the model calls tools is suppressed (we don't know which it is until
+    /// the tool_use block starts, so text before the first tool_use IS printed).
+    /// Default implementation ignores `on_text` and falls back to non-streaming.
+    async fn complete_with_tools_streaming(
+        &self,
+        req: ClaudeRequest<'_>,
+        _on_text: Arc<dyn Fn(String) + Send + Sync>,
+    ) -> Result<LlmResponse> {
+        self.complete_with_tools(req).await
     }
 }
 
@@ -281,6 +295,170 @@ impl LlmClient for ClaudeClient {
             stop_reason: resp.stop_reason,
             raw_blocks,
         })
+    }
+
+    async fn complete_with_tools_streaming(
+        &self,
+        req: ClaudeRequest<'_>,
+        on_text: Arc<dyn Fn(String) + Send + Sync>,
+    ) -> Result<LlmResponse> {
+        let mut body = serde_json::json!({
+            "model": self.config.model,
+            "max_tokens": req.max_tokens,
+            "system": req.system,
+            "messages": req.messages,
+            "stream": true,
+        });
+        if !req.tools.is_empty() {
+            body["tools"] = serde_json::to_value(req.tools)
+                .context("Failed to serialize tool definitions")?;
+        }
+
+        debug!(
+            "Sending streaming request to Claude API (model={}, tools={})",
+            self.config.model,
+            req.tools.len()
+        );
+
+        let response = self
+            .http
+            .post("https://api.anthropic.com/v1/messages")
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .context("Failed to send request to Claude API")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body_text = response.text().await.unwrap_or_default();
+            bail!("Claude API returned {status}: {body_text}");
+        }
+
+        let mut stream = response.bytes_stream();
+        let mut buffer = String::new();
+
+        // Per-block state (indexed by content_block index from the SSE events).
+        let mut block_types:       Vec<String> = Vec::new(); // "text" | "tool_use"
+        let mut block_texts:       Vec<String> = Vec::new();
+        let mut block_tool_ids:    Vec<String> = Vec::new();
+        let mut block_tool_names:  Vec<String> = Vec::new();
+        let mut block_tool_inputs: Vec<String> = Vec::new(); // accumulated partial JSON
+
+        // Once we see a tool_use block we stop streaming text to the callback.
+        // Text that arrived before the tool_use block was already printed.
+        let mut has_tool_use = false;
+        let mut stop_reason = "end_turn".to_string();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk: Bytes = chunk.context("Error reading stream chunk")?;
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+            while let Some(line_end) = buffer.find('\n') {
+                let line = buffer[..line_end].trim_end_matches('\r').to_string();
+                buffer = buffer[line_end + 1..].to_string();
+
+                let data = match line.strip_prefix("data: ") {
+                    Some(d) if d != "[DONE]" => d.to_string(),
+                    _ => continue,
+                };
+
+                let v: serde_json::Value = match serde_json::from_str(&data) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+
+                match v["type"].as_str().unwrap_or("") {
+                    "content_block_start" => {
+                        let idx = v["index"].as_u64().unwrap_or(0) as usize;
+                        let block_type = v["content_block"]["type"].as_str().unwrap_or("").to_string();
+                        while block_types.len() <= idx {
+                            block_types.push(String::new());
+                            block_texts.push(String::new());
+                            block_tool_ids.push(String::new());
+                            block_tool_names.push(String::new());
+                            block_tool_inputs.push(String::new());
+                        }
+                        if block_type == "tool_use" {
+                            has_tool_use = true;
+                            block_tool_ids[idx] = v["content_block"]["id"]
+                                .as_str().unwrap_or("").to_string();
+                            block_tool_names[idx] = v["content_block"]["name"]
+                                .as_str().unwrap_or("").to_string();
+                        }
+                        block_types[idx] = block_type;
+                    }
+                    "content_block_delta" => {
+                        let idx = v["index"].as_u64().unwrap_or(0) as usize;
+                        match v["delta"]["type"].as_str().unwrap_or("") {
+                            "text_delta" => {
+                                let text = v["delta"]["text"].as_str().unwrap_or("").to_string();
+                                if idx < block_texts.len() {
+                                    block_texts[idx].push_str(&text);
+                                }
+                                // Stream text only while no tool_use block has appeared.
+                                if !has_tool_use {
+                                    on_text(text);
+                                }
+                            }
+                            "input_json_delta" => {
+                                let partial = v["delta"]["partial_json"].as_str().unwrap_or("").to_string();
+                                if idx < block_tool_inputs.len() {
+                                    block_tool_inputs[idx].push_str(&partial);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    "message_delta" => {
+                        if let Some(sr) = v["delta"]["stop_reason"].as_str() {
+                            stop_reason = sr.to_string();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Assemble LlmResponse from accumulated block state.
+        let mut text = String::new();
+        let mut tool_calls = Vec::new();
+        let mut raw_blocks = Vec::new();
+
+        for i in 0..block_types.len() {
+            match block_types[i].as_str() {
+                "text" => {
+                    text.push_str(&block_texts[i]);
+                    raw_blocks.push(ContentBlock::Text { text: block_texts[i].clone() });
+                }
+                "tool_use" => {
+                    let input: serde_json::Value =
+                        serde_json::from_str(&block_tool_inputs[i])
+                            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                    raw_blocks.push(ContentBlock::ToolUse {
+                        id: block_tool_ids[i].clone(),
+                        name: block_tool_names[i].clone(),
+                        input: input.clone(),
+                    });
+                    tool_calls.push(ToolUseBlock {
+                        id: block_tool_ids[i].clone(),
+                        name: block_tool_names[i].clone(),
+                        input,
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        debug!(
+            "Streaming complete: {} chars, {} tool calls, stop_reason={stop_reason}",
+            text.len(),
+            tool_calls.len()
+        );
+
+        Ok(LlmResponse { text, tool_calls, stop_reason, raw_blocks })
     }
 }
 

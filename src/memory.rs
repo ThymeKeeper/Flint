@@ -1,23 +1,13 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use std::collections::HashMap;
+use duckdb::Connection;
 use std::fmt;
-use std::sync::Arc;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 use tracing::{debug, info};
 use uuid::Uuid;
 
-use qdrant_client::Qdrant;
-use qdrant_client::qdrant::{
-    vectors_config::Config as VCVariant,
-    Condition, CountPointsBuilder, CreateCollectionBuilder, DeletePointsBuilder, Distance, Filter,
-    PointId, PointStruct, PointsIdsList, ScrollPointsBuilder, SearchPointsBuilder,
-    SetPayloadPointsBuilder, UpsertPointsBuilder, VectorParams, VectorsConfig, Value,
-    point_id::PointIdOptions,
-    value::Kind,
-    vectors_output::VectorsOptions as OutputVectorsOptions,
-};
-
-use crate::config::{MemoryConfig, QdrantConfig};
+use crate::config::MemoryConfig;
 use crate::embeddings::{cosine_similarity, EmbeddingClient};
 
 // ---------------------------------------------------------------------------
@@ -70,6 +60,9 @@ pub struct Memory {
     pub created_at: DateTime<Utc>,
     pub last_accessed: DateTime<Utc>,
     pub access_count: i64,
+    /// Pinned memories are never decayed and never pruned.
+    /// Procedural memories are automatically pinned on creation.
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -79,94 +72,152 @@ pub struct MemoryRef {
     pub kind: MemoryKind,
     pub importance: f64,
     pub similarity: f64,
+    pub pinned: bool,
+    pub created_at: DateTime<Utc>,
 }
 
 // ---------------------------------------------------------------------------
-// MemoryManager — backed by Qdrant
+// MemoryManager — backed by DuckDB
 // ---------------------------------------------------------------------------
 
 pub struct MemoryManager {
-    client: Arc<Qdrant>,
+    db: Arc<Mutex<Connection>>,
     embedder: Arc<dyn EmbeddingClient>,
     config: MemoryConfig,
-    collection: String,
+    /// Dimension of stored embeddings (e.g. 1024 for Voyage).
+    #[allow(dead_code)]
+    embedding_dim: usize,
 }
 
 impl MemoryManager {
-    /// Connect to Qdrant and create the collection if it doesn't exist.
+    /// Open (or create) the DuckDB database and ensure the schema exists.
+    /// Pass `db_path = Path::new(":memory:")` for an in-memory database (tests).
     pub async fn new(
-        qdrant_config: QdrantConfig,
+        db_path: &Path,
         embedder: Arc<dyn EmbeddingClient>,
         config: MemoryConfig,
+        embedding_dim: usize,
     ) -> Result<Self> {
-        let client = Qdrant::from_url(&qdrant_config.url)
-            .build()
-            .context("Failed to connect to Qdrant")?;
-        let client = Arc::new(client);
-        let collection = qdrant_config.collection.clone();
-
-        if !client
-            .collection_exists(&collection)
-            .await
-            .context("Failed to check Qdrant collection existence")?
-        {
-            client
-                .create_collection(
-                    CreateCollectionBuilder::new(&collection).vectors_config(VectorsConfig {
-                        config: Some(VCVariant::Params(VectorParams {
-                            size: 1024,
-                            distance: Distance::Cosine.into(),
-                            ..Default::default()
-                        })),
-                    }),
-                )
-                .await
-                .context("Failed to create Qdrant collection")?;
-            info!("Created Qdrant collection '{collection}'");
+        let conn = if db_path == Path::new(":memory:") {
+            Connection::open_in_memory()
+        } else {
+            Connection::open(db_path)
         }
+        .context("Failed to open DuckDB database")?;
 
-        Ok(Self { client, embedder, config, collection })
+        // Embedding stored as JSON text (e.g. "[0.1,0.2,...]") — avoids DuckDB
+        // array-type binding limitations and works across all DuckDB versions.
+        let ddl = "CREATE TABLE IF NOT EXISTS memories (
+                id            VARCHAR PRIMARY KEY,
+                content       VARCHAR NOT NULL,
+                embedding     VARCHAR,
+                kind          VARCHAR NOT NULL,
+                importance    DOUBLE  NOT NULL,
+                source        VARCHAR NOT NULL,
+                created_at    VARCHAR NOT NULL,
+                last_accessed VARCHAR NOT NULL,
+                access_count  BIGINT  NOT NULL DEFAULT 0,
+                pinned        BOOLEAN NOT NULL DEFAULT false
+            )";
+        conn.execute_batch(ddl)
+            .context("Failed to create memories table")?;
+
+        info!(
+            "Memory database ready at {} (dim={})",
+            db_path.display(),
+            embedding_dim
+        );
+
+        Ok(Self {
+            db: Arc::new(Mutex::new(conn)),
+            embedder,
+            config,
+            embedding_dim,
+        })
     }
 
-    /// Embed query text and return top-k most similar memories.
+    // -----------------------------------------------------------------------
+    // search
+    // -----------------------------------------------------------------------
+
     pub async fn search(&self, query: &str, top_k: Option<usize>) -> Result<Vec<MemoryRef>> {
         let k = top_k.unwrap_or(self.config.top_k_retrieval);
         debug!("Memory search: query={} k={k}", truncate(query, 50));
 
-        let embedding = self.embedder.embed(query).await?;
-        let result = self
-            .client
-            .search_points(
-                SearchPointsBuilder::new(&self.collection, embedding, k as u64)
-                    .with_payload(true),
-            )
-            .await
-            .context("Qdrant search failed")?;
+        let query_embedding = self.embedder.embed(query).await?;
+        let db = self.db.clone();
 
-        let mut refs = Vec::new();
-        for scored in result.result {
-            let id = point_id_str(&scored.id);
-            if id.is_empty() {
-                continue;
+        let refs = tokio::task::spawn_blocking(move || -> Result<Vec<MemoryRef>> {
+            let conn = db.lock().unwrap();
+
+            // Fetch all rows; compute similarity in Rust (works with any dim, no SQL casts).
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, content, kind, importance, embedding, pinned, created_at
+                     FROM memories",
+                )
+                .context("prepare search failed")?;
+
+            let rows: Vec<(String, String, String, f64, Option<String>, bool, String)> = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                })
+                .context("query_map failed")?
+                .collect::<duckdb::Result<Vec<_>>>()
+                .context("collect failed")?;
+
+            let mut scored: Vec<MemoryRef> = rows
+                .into_iter()
+                .map(|(id, content, kind_str, importance, emb_json, pinned, created_at)| {
+                    let similarity = if query_embedding.is_empty() {
+                        0.0
+                    } else {
+                        let row_emb = emb_json
+                            .as_deref()
+                            .and_then(|s| serde_json::from_str::<Vec<f32>>(s).ok())
+                            .unwrap_or_default();
+                        cosine_similarity(&query_embedding, &row_emb) as f64
+                    };
+                    MemoryRef {
+                        id,
+                        content,
+                        kind: MemoryKind::from_str_safe(&kind_str),
+                        importance,
+                        similarity,
+                        pinned,
+                        created_at: parse_ts(&created_at),
+                    }
+                })
+                .collect();
+
+            // Sort: if we have embeddings, rank by similarity; otherwise by importance.
+            if query_embedding.is_empty() {
+                scored.sort_by(|a, b| b.importance.partial_cmp(&a.importance).unwrap());
+            } else {
+                scored.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap());
             }
-            refs.push(MemoryRef {
-                id,
-                content: get_str(&scored.payload, "content")
-                    .unwrap_or_default()
-                    .to_string(),
-                kind: MemoryKind::from_str_safe(
-                    get_str(&scored.payload, "kind").unwrap_or("episodic"),
-                ),
-                importance: get_f64(&scored.payload, "importance").unwrap_or(0.5),
-                similarity: scored.score as f64,
-            });
-        }
+            scored.truncate(k);
+            Ok(scored)
+        })
+        .await
+        .context("spawn_blocking failed")??;
 
         debug!("Memory search returned {} results", refs.len());
         Ok(refs)
     }
 
-    /// Embed content and store as a new memory point.
+    // -----------------------------------------------------------------------
+    // store
+    // -----------------------------------------------------------------------
+
     pub async fn store(
         &self,
         content: &str,
@@ -177,198 +228,369 @@ impl MemoryManager {
         let id = Uuid::new_v4().to_string();
         let embedding = self.embedder.embed(content).await?;
         let now = Utc::now().to_rfc3339();
+        let content = content.to_string();
+        // Procedural memories (how to do things on the user's computer) are
+        // automatically pinned — they skip decay and pruning entirely.
+        let pinned = kind == MemoryKind::Procedural;
+        let kind_str = kind.as_str().to_string();
+        let source = source.to_string();
+        let id2 = id.clone();
+        let db = self.db.clone();
 
-        let mut payload: HashMap<String, Value> = HashMap::new();
-        payload.insert("content".to_string(), content.to_string().into());
-        payload.insert("kind".to_string(), kind.as_str().to_string().into());
-        payload.insert("importance".to_string(), importance.into());
-        payload.insert("source".to_string(), source.to_string().into());
-        payload.insert("created_at".to_string(), now.clone().into());
-        payload.insert("last_accessed".to_string(), now.into());
-        payload.insert("access_count".to_string(), 0i64.into());
+        debug!("Storing {kind} memory (pinned={pinned}): {}", truncate(&content, 80));
 
-        self.client
-            .upsert_points(UpsertPointsBuilder::new(
-                &self.collection,
-                vec![PointStruct::new(id.clone(), embedding, payload)],
-            ))
-            .await
-            .context("Qdrant upsert failed")?;
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = db.lock().unwrap();
+            let emb_json: Option<String> = if embedding.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&embedding).context("Failed to serialize embedding")?)
+            };
+            conn.execute(
+                "INSERT INTO memories
+                 (id, content, embedding, kind, importance, source, created_at, last_accessed, access_count, pinned)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+                duckdb::params![id2, content, emb_json, kind_str, importance, source, now, now, pinned],
+            )
+            .context("Failed to insert memory")?;
+            Ok(())
+        })
+        .await
+        .context("spawn_blocking failed")??;
 
-        debug!("Stored {kind} memory {id}: {}", truncate(content, 80));
         Ok(id)
     }
 
-    /// Update last_accessed for all given IDs (same timestamp — "now").
+    // -----------------------------------------------------------------------
+    // mark_accessed
+    // -----------------------------------------------------------------------
+
     pub async fn mark_accessed(&self, ids: &[String]) -> Result<()> {
         if ids.is_empty() {
             return Ok(());
         }
-        let mut payload: HashMap<String, Value> = HashMap::new();
-        payload.insert("last_accessed".to_string(), Utc::now().to_rfc3339().into());
+        let now = Utc::now().to_rfc3339();
+        let ids = ids.to_vec();
+        let db = self.db.clone();
 
-        self.client
-            .set_payload(
-                SetPayloadPointsBuilder::new(&self.collection, payload)
-                    .points_selector(PointsIdsList {
-                        ids: ids.iter().map(|s| s.clone().into()).collect(),
-                    }),
-            )
-            .await
-            .context("Qdrant set_payload failed")?;
-
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = db.lock().unwrap();
+            for id in &ids {
+                conn.execute(
+                    "UPDATE memories
+                     SET last_accessed = ?, access_count = access_count + 1
+                     WHERE id = ?",
+                    duckdb::params![now, id],
+                )
+                .context("mark_accessed failed")?;
+            }
+            Ok(())
+        })
+        .await
+        .context("spawn_blocking failed")??;
         Ok(())
     }
 
-    /// Decay importance scores: importance *= exp(-age_days / decay_days).
-    /// Returns the number of memories whose importance was updated.
-    pub async fn decay(&self) -> Result<usize> {
-        info!(
-            "Running importance decay (half-life={}d)",
-            self.config.importance_decay_days
-        );
-        let now = Utc::now();
-        let result = self
-            .client
-            .scroll(
-                ScrollPointsBuilder::new(&self.collection)
-                    .with_payload(true)
-                    .with_vectors(false)
-                    .limit(50_000u32),
-            )
-            .await
-            .context("Qdrant scroll failed during decay")?;
+    // -----------------------------------------------------------------------
+    // update
+    // -----------------------------------------------------------------------
 
-        let mut count = 0usize;
-        for point in result.result {
-            let id = point_id_str(&point.id);
-            if id.is_empty() {
-                continue;
+    /// Update an existing memory. Any None field is left unchanged.
+    /// If `new_content` is provided the embedding is recomputed.
+    /// Returns `true` if the memory was found, `false` if the ID doesn't exist.
+    pub async fn update(
+        &self,
+        id: &str,
+        new_content: Option<&str>,
+        new_importance: Option<f64>,
+        new_pinned: Option<bool>,
+    ) -> Result<bool> {
+        // Recompute embedding outside spawn_blocking (async embedder).
+        let (content_owned, new_embedding) = if let Some(c) = new_content {
+            let emb = self.embedder.embed(c).await?;
+            (Some(c.to_string()), Some(emb))
+        } else {
+            (None, None)
+        };
+
+        let id = id.to_string();
+        let db = self.db.clone();
+
+        tokio::task::spawn_blocking(move || -> Result<bool> {
+            let conn = db.lock().unwrap();
+
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM memories WHERE id = ?",
+                    duckdb::params![id],
+                    |row| row.get(0),
+                )
+                .context("Failed to check memory existence")?;
+            if count == 0 {
+                return Ok(false);
             }
-            let importance = get_f64(&point.payload, "importance").unwrap_or(0.5);
-            let age_days = get_str(&point.payload, "created_at")
-                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| (now - dt.with_timezone(&Utc)).num_seconds() as f64 / 86400.0)
-                .unwrap_or(0.0);
 
-            let new_importance =
-                importance * (-age_days / self.config.importance_decay_days).exp();
-            if (new_importance - importance).abs() > 0.001 {
-                let mut p: HashMap<String, Value> = HashMap::new();
-                p.insert("importance".to_string(), new_importance.into());
-                let _ = self
-                    .client
-                    .set_payload(
-                        SetPayloadPointsBuilder::new(&self.collection, p)
-                            .points_selector(PointsIdsList { ids: vec![id.into()] }),
-                    )
-                    .await;
-                count += 1;
+            if let (Some(content), Some(embs)) = (&content_owned, &new_embedding) {
+                let emb_json: Option<String> = if embs.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::to_string(embs).context("Failed to serialize embedding")?)
+                };
+                conn.execute(
+                    "UPDATE memories SET content = ?, embedding = ? WHERE id = ?",
+                    duckdb::params![content, emb_json, id],
+                )
+                .context("Failed to update content")?;
             }
-        }
-
-        info!("Decayed importance for {count} memories");
-        Ok(count)
+            if let Some(imp) = new_importance {
+                conn.execute(
+                    "UPDATE memories SET importance = ? WHERE id = ?",
+                    duckdb::params![imp, id],
+                )
+                .context("Failed to update importance")?;
+            }
+            if let Some(pin) = new_pinned {
+                conn.execute(
+                    "UPDATE memories SET pinned = ? WHERE id = ?",
+                    duckdb::params![pin, id],
+                )
+                .context("Failed to update pinned")?;
+            }
+            Ok(true)
+        })
+        .await
+        .context("spawn_blocking failed")?
     }
 
-    /// Delete memories below min_importance or episodic memories past TTL.
-    /// Returns the number of memories deleted.
+    // -----------------------------------------------------------------------
+    // pin / unpin
+    // -----------------------------------------------------------------------
+
+    /// Pin a memory so it is never decayed or pruned.
+    pub async fn pin(&self, id: &str) -> Result<()> {
+        self.set_pinned(id, true).await
+    }
+
+    /// Unpin a memory, allowing normal decay and pruning again.
+    pub async fn unpin(&self, id: &str) -> Result<()> {
+        self.set_pinned(id, false).await
+    }
+
+    async fn set_pinned(&self, id: &str, pinned: bool) -> Result<()> {
+        let id = id.to_string();
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE memories SET pinned = ? WHERE id = ?",
+                duckdb::params![pinned, id],
+            )
+            .context("Failed to update pinned flag")?;
+            Ok(())
+        })
+        .await
+        .context("spawn_blocking failed")??;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // decay
+    // -----------------------------------------------------------------------
+
+    pub async fn decay(&self) -> Result<usize> {
+        info!(
+            "Running importance decay (episodic half-life={}d, semantic 10x, procedural/pinned exempt)",
+            self.config.importance_decay_days
+        );
+        let base_decay_days = self.config.importance_decay_days;
+        let db = self.db.clone();
+        let now = Utc::now();
+
+        tokio::task::spawn_blocking(move || -> Result<usize> {
+            let conn = db.lock().unwrap();
+
+            #[derive(Debug)]
+            struct Row { id: String, kind: String, importance: f64, created_at: String, pinned: bool }
+
+            let mut stmt = conn
+                .prepare("SELECT id, kind, importance, created_at, pinned FROM memories")
+                .context("prepare decay failed")?;
+            let rows: Vec<Row> = stmt
+                .query_map([], |row| {
+                    Ok(Row {
+                        id: row.get(0)?,
+                        kind: row.get(1)?,
+                        importance: row.get(2)?,
+                        created_at: row.get(3)?,
+                        pinned: row.get(4)?,
+                    })
+                })
+                .context("query_map decay failed")?
+                .collect::<duckdb::Result<Vec<_>>>()
+                .context("collect decay failed")?;
+
+            let mut count = 0;
+            for row in &rows {
+                // Pinned and procedural memories never decay.
+                if row.pinned || row.kind == "procedural" {
+                    continue;
+                }
+                // Semantic and reflection memories decay 10x slower than episodic
+                // — rapport and long-term facts persist for years.
+                let half_life = match row.kind.as_str() {
+                    "semantic" | "reflection" => base_decay_days * 10.0,
+                    _ => base_decay_days, // episodic
+                };
+                let age_days = DateTime::parse_from_rfc3339(&row.created_at)
+                    .map(|dt| (now - dt.with_timezone(&Utc)).num_seconds() as f64 / 86400.0)
+                    .unwrap_or(0.0);
+                let new_importance = row.importance * (-age_days / half_life).exp();
+                if (new_importance - row.importance).abs() > 0.001 {
+                    conn.execute(
+                        "UPDATE memories SET importance = ? WHERE id = ?",
+                        duckdb::params![new_importance, row.id],
+                    )
+                    .context("decay update failed")?;
+                    count += 1;
+                }
+            }
+            Ok(count)
+        })
+        .await
+        .context("spawn_blocking failed")?
+    }
+
+    // -----------------------------------------------------------------------
+    // prune
+    // -----------------------------------------------------------------------
+
     pub async fn prune(&self) -> Result<usize> {
         info!(
             "Pruning memories (min_importance={}, episodic_ttl={}d)",
             self.config.min_importance_to_keep, self.config.ttl_days_episodic
         );
+        let min_importance = self.config.min_importance_to_keep;
+        let ttl_days = self.config.ttl_days_episodic;
+        let db = self.db.clone();
         let now = Utc::now();
-        let result = self
-            .client
-            .scroll(
-                ScrollPointsBuilder::new(&self.collection)
-                    .with_payload(true)
-                    .with_vectors(false)
-                    .limit(50_000u32),
-            )
-            .await
-            .context("Qdrant scroll failed during prune")?;
 
-        let mut to_delete: Vec<String> = Vec::new();
-        for point in result.result {
-            let id = point_id_str(&point.id);
-            if id.is_empty() {
-                continue;
-            }
-            let importance = get_f64(&point.payload, "importance").unwrap_or(0.5);
-            let kind = get_str(&point.payload, "kind").unwrap_or("episodic");
-            let age_days = get_str(&point.payload, "created_at")
-                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| (now - dt.with_timezone(&Utc)).num_seconds() as f64 / 86400.0)
-                .unwrap_or(0.0);
-            let expired = kind == "episodic" && age_days > self.config.ttl_days_episodic;
-            if importance < self.config.min_importance_to_keep || expired {
-                to_delete.push(id);
-            }
-        }
+        tokio::task::spawn_blocking(move || -> Result<usize> {
+            let conn = db.lock().unwrap();
 
-        let count = to_delete.len();
-        if !to_delete.is_empty() {
-            self.delete(&to_delete).await?;
-        }
-        info!("Pruned {count} memories");
-        Ok(count)
+            #[derive(Debug)]
+            struct Row { id: String, importance: f64, kind: String, created_at: String, pinned: bool }
+
+            let mut stmt = conn
+                .prepare("SELECT id, importance, kind, created_at, pinned FROM memories")
+                .context("prepare prune failed")?;
+            let rows: Vec<Row> = stmt
+                .query_map([], |row| {
+                    Ok(Row {
+                        id: row.get(0)?,
+                        importance: row.get(1)?,
+                        kind: row.get(2)?,
+                        created_at: row.get(3)?,
+                        pinned: row.get(4)?,
+                    })
+                })
+                .context("query_map prune failed")?
+                .collect::<duckdb::Result<Vec<_>>>()
+                .context("collect prune failed")?;
+
+            let to_delete: Vec<String> = rows
+                .into_iter()
+                .filter(|row| {
+                    // Pinned and procedural memories are never pruned.
+                    if row.pinned || row.kind == "procedural" {
+                        return false;
+                    }
+                    let age_days = DateTime::parse_from_rfc3339(&row.created_at)
+                        .map(|dt| {
+                            (now - dt.with_timezone(&Utc)).num_seconds() as f64 / 86400.0
+                        })
+                        .unwrap_or(0.0);
+                    // Only episodic memories expire by age.
+                    // Semantic and reflection are only pruned if importance drops below floor.
+                    let expired = row.kind == "episodic" && age_days > ttl_days;
+                    row.importance < min_importance || expired
+                })
+                .map(|r| r.id)
+                .collect();
+
+            let count = to_delete.len();
+            for id in &to_delete {
+                conn.execute("DELETE FROM memories WHERE id = ?", duckdb::params![id])
+                    .context("prune delete failed")?;
+            }
+            Ok(count)
+        })
+        .await
+        .context("spawn_blocking failed")?
     }
 
-    /// Find clusters of similar episodic memories (cosine >= 0.85, min size 3).
-    /// Fetches embeddings from Qdrant and clusters in-process.
+    // -----------------------------------------------------------------------
+    // find_episodic_clusters — fetches embeddings, clusters in-process
+    // -----------------------------------------------------------------------
+
     pub async fn find_episodic_clusters(&self) -> Result<Vec<Vec<Memory>>> {
-        let result = self
-            .client
-            .scroll(
-                ScrollPointsBuilder::new(&self.collection)
-                    .filter(Filter::must(vec![Condition::matches(
-                        "kind",
-                        "episodic".to_string(),
-                    )]))
-                    .with_payload(true)
-                    .with_vectors(true)
-                    .limit(1000u32),
-            )
-            .await
-            .context("Qdrant scroll failed during clustering")?;
+        let db = self.db.clone();
 
-        let mut memories: Vec<Memory> = Vec::new();
-        for point in result.result {
-            let id = point_id_str(&point.id);
-            if id.is_empty() {
-                continue;
-            }
-            let embedding = match &point.vectors {
-                Some(v) => match &v.vectors_options {
-                    #[allow(deprecated)]
-                    Some(OutputVectorsOptions::Vector(dense)) => dense.data.clone(),
-                    _ => continue,
-                },
-                None => continue,
-            };
-            if embedding.is_empty() {
-                continue;
-            }
-            memories.push(Memory {
-                id,
-                content: get_str(&point.payload, "content")
-                    .unwrap_or_default()
-                    .to_string(),
-                embedding,
-                kind: MemoryKind::Episodic,
-                importance: get_f64(&point.payload, "importance").unwrap_or(0.5),
-                source: get_str(&point.payload, "source").unwrap_or("").to_string(),
-                created_at: parse_ts(get_str(&point.payload, "created_at").unwrap_or("")),
-                last_accessed: parse_ts(
-                    get_str(&point.payload, "last_accessed").unwrap_or(""),
-                ),
-                access_count: get_i64(&point.payload, "access_count").unwrap_or(0),
-            });
-        }
+        let memories: Vec<Memory> = tokio::task::spawn_blocking(move || -> Result<Vec<Memory>> {
+            let conn = db.lock().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, content, importance, source, created_at, last_accessed,
+                            access_count, embedding, pinned
+                     FROM memories
+                     WHERE kind = 'episodic' AND embedding IS NOT NULL
+                     LIMIT 1000",
+                )
+                .context("prepare cluster query failed")?;
 
-        // Greedy clustering
+            let memories = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,    // id
+                        row.get::<_, String>(1)?,    // content
+                        row.get::<_, f64>(2)?,       // importance
+                        row.get::<_, String>(3)?,    // source
+                        row.get::<_, String>(4)?,    // created_at
+                        row.get::<_, String>(5)?,    // last_accessed
+                        row.get::<_, i64>(6)?,       // access_count
+                        row.get::<_, Option<String>>(7)?, // embedding JSON
+                        row.get::<_, bool>(8)?,      // pinned
+                    ))
+                })
+                .context("query_map cluster failed")?
+                .filter_map(|r| r.ok())
+                .filter_map(|(id, content, importance, source, ca, la, ac, emb_json, pinned)| {
+                    let embedding = emb_json
+                        .as_deref()
+                        .and_then(|s| serde_json::from_str::<Vec<f32>>(s).ok())
+                        .unwrap_or_default();
+                    if embedding.is_empty() {
+                        return None;
+                    }
+                    Some(Memory {
+                        id,
+                        content,
+                        embedding,
+                        kind: MemoryKind::Episodic,
+                        importance,
+                        source,
+                        created_at: parse_ts(&ca),
+                        last_accessed: parse_ts(&la),
+                        access_count: ac,
+                        pinned,
+                    })
+                })
+                .collect();
+            Ok(memories)
+        })
+        .await
+        .context("spawn_blocking failed")??;
+
+        // Greedy clustering — same algorithm as before
         let n = memories.len();
         let mut used = vec![false; n];
         let mut clusters: Vec<Vec<Memory>> = Vec::new();
@@ -391,73 +613,92 @@ impl MemoryManager {
                 clusters.push(cluster.into_iter().map(|idx| memories[idx].clone()).collect());
             }
         }
-
         Ok(clusters)
     }
 
-    /// Delete memories by ID.
+    // -----------------------------------------------------------------------
+    // delete
+    // -----------------------------------------------------------------------
+
     pub async fn delete(&self, ids: &[String]) -> Result<()> {
         if ids.is_empty() {
             return Ok(());
         }
-        let point_ids: Vec<PointId> = ids.iter().map(|s| s.clone().into()).collect();
-        self.client
-            .delete_points(
-                DeletePointsBuilder::new(&self.collection)
-                    .points(PointsIdsList { ids: point_ids }),
-            )
-            .await
-            .context("Qdrant delete failed")?;
+        let ids = ids.to_vec();
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = db.lock().unwrap();
+            for id in &ids {
+                conn.execute("DELETE FROM memories WHERE id = ?", duckdb::params![id])
+                    .context("delete failed")?;
+            }
+            Ok(())
+        })
+        .await
+        .context("spawn_blocking failed")??;
         Ok(())
     }
 
-    /// Return up to N memories (order not guaranteed — used for heartbeat reflection).
+    // -----------------------------------------------------------------------
+    // recent
+    // -----------------------------------------------------------------------
+
     pub async fn recent(&self, n: usize) -> Result<Vec<MemoryRef>> {
-        let result = self
-            .client
-            .scroll(
-                ScrollPointsBuilder::new(&self.collection)
-                    .with_payload(true)
-                    .with_vectors(false)
-                    .limit(n as u32),
-            )
-            .await
-            .context("Qdrant scroll failed")?;
-
-        Ok(result
-            .result
-            .iter()
-            .filter_map(|point| {
-                let id = point_id_str(&point.id);
-                if id.is_empty() {
-                    return None;
-                }
-                Some(MemoryRef {
-                    id,
-                    content: get_str(&point.payload, "content")
-                        .unwrap_or_default()
-                        .to_string(),
-                    kind: MemoryKind::from_str_safe(
-                        get_str(&point.payload, "kind").unwrap_or("episodic"),
-                    ),
-                    importance: get_f64(&point.payload, "importance").unwrap_or(0.5),
-                    similarity: 0.0,
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<MemoryRef>> {
+            let conn = db.lock().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, content, kind, importance, pinned, created_at
+                     FROM memories
+                     ORDER BY created_at DESC
+                     LIMIT ?",
+                )
+                .context("prepare recent failed")?;
+            let refs = stmt
+                .query_map([n as i64], |row| {
+                    let kind: String = row.get(2)?;
+                    let created_at: String = row.get(5)?;
+                    Ok(MemoryRef {
+                        id: row.get(0)?,
+                        content: row.get(1)?,
+                        kind: MemoryKind::from_str_safe(&kind),
+                        importance: row.get(3)?,
+                        similarity: 0.0,
+                        pinned: row.get(4)?,
+                        created_at: parse_ts(&created_at),
+                    })
                 })
-            })
-            .collect())
+                .context("query_map recent failed")?
+                .collect::<duckdb::Result<Vec<_>>>()
+                .context("collect recent failed")?;
+            Ok(refs)
+        })
+        .await
+        .context("spawn_blocking failed")?
     }
 
-    /// Total number of memory points in the collection.
+    // -----------------------------------------------------------------------
+    // count
+    // -----------------------------------------------------------------------
+
     pub async fn count(&self) -> Result<usize> {
-        let result = self
-            .client
-            .count(CountPointsBuilder::new(&self.collection))
-            .await
-            .context("Qdrant count failed")?;
-        Ok(result.result.map(|r| r.count as usize).unwrap_or(0))
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> Result<usize> {
+            let conn = db.lock().unwrap();
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
+                .context("count query failed")?;
+            Ok(count as usize)
+        })
+        .await
+        .context("spawn_blocking failed")?
     }
 
-    /// Format MemoryRef list as a prompt section.
+    // -----------------------------------------------------------------------
+    // format_memories_for_prompt (unchanged)
+    // -----------------------------------------------------------------------
+
     pub fn format_memories_for_prompt(memories: &[MemoryRef]) -> String {
         if memories.is_empty() {
             return String::from("[No relevant memories found]");
@@ -478,38 +719,8 @@ impl MemoryManager {
 }
 
 // ---------------------------------------------------------------------------
-// Payload helpers
+// Helpers
 // ---------------------------------------------------------------------------
-
-fn point_id_str(id: &Option<PointId>) -> String {
-    match id {
-        Some(PointId { point_id_options: Some(PointIdOptions::Uuid(s)) }) => s.clone(),
-        Some(PointId { point_id_options: Some(PointIdOptions::Num(n)) }) => n.to_string(),
-        _ => String::new(),
-    }
-}
-
-fn get_str<'a>(payload: &'a HashMap<String, Value>, key: &str) -> Option<&'a str> {
-    match &payload.get(key)?.kind {
-        Some(Kind::StringValue(s)) => Some(s.as_str()),
-        _ => None,
-    }
-}
-
-fn get_f64(payload: &HashMap<String, Value>, key: &str) -> Option<f64> {
-    match &payload.get(key)?.kind {
-        Some(Kind::DoubleValue(d)) => Some(*d),
-        Some(Kind::IntegerValue(i)) => Some(*i as f64),
-        _ => None,
-    }
-}
-
-fn get_i64(payload: &HashMap<String, Value>, key: &str) -> Option<i64> {
-    match &payload.get(key)?.kind {
-        Some(Kind::IntegerValue(i)) => Some(*i),
-        _ => None,
-    }
-}
 
 fn parse_ts(s: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(s)
@@ -532,7 +743,24 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::embeddings::cosine_similarity;
+    use crate::embeddings::{cosine_similarity, mock::MockEmbeddingClient};
+
+    fn test_config() -> MemoryConfig {
+        MemoryConfig {
+            max_memories: 1000,
+            top_k_retrieval: 5,
+            importance_decay_days: 30.0,
+            min_importance_to_keep: 0.1,
+            ttl_days_episodic: 90.0,
+        }
+    }
+
+    async fn in_memory_manager() -> MemoryManager {
+        let embedder = Arc::new(MockEmbeddingClient::new(4)); // tiny dim for tests
+        MemoryManager::new(Path::new(":memory:"), embedder, test_config(), 4)
+            .await
+            .unwrap()
+    }
 
     #[test]
     fn test_memory_kind_roundtrip() {
@@ -568,13 +796,17 @@ mod tests {
                 kind: MemoryKind::Semantic,
                 importance: 0.8,
                 similarity: 0.92,
+                pinned: false,
+                created_at: Utc::now(),
             },
             MemoryRef {
                 id: "b".to_string(),
-                content: "Discussed Qdrant yesterday".to_string(),
+                content: "Discussed DuckDB yesterday".to_string(),
                 kind: MemoryKind::Episodic,
                 importance: 0.6,
                 similarity: 0.75,
+                pinned: false,
+                created_at: Utc::now(),
             },
         ];
         let result = MemoryManager::format_memories_for_prompt(&mems);
@@ -598,5 +830,67 @@ mod tests {
         let a: Vec<f32> = vec![];
         let b: Vec<f32> = vec![];
         assert_eq!(cosine_similarity(&a, &b), 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_store_and_count() {
+        let mgr = in_memory_manager().await;
+        assert_eq!(mgr.count().await.unwrap(), 0);
+        mgr.store("hello world", MemoryKind::Semantic, "test", 0.8)
+            .await
+            .unwrap();
+        assert_eq!(mgr.count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_store_and_search() {
+        let mgr = in_memory_manager().await;
+        mgr.store("The user likes Rust", MemoryKind::Semantic, "test", 0.8)
+            .await
+            .unwrap();
+        let results = mgr.search("Rust programming", Some(5)).await.unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].content, "The user likes Rust");
+    }
+
+    #[tokio::test]
+    async fn test_delete() {
+        let mgr = in_memory_manager().await;
+        let id = mgr
+            .store("To be deleted", MemoryKind::Episodic, "test", 0.5)
+            .await
+            .unwrap();
+        assert_eq!(mgr.count().await.unwrap(), 1);
+        mgr.delete(&[id]).await.unwrap();
+        assert_eq!(mgr.count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_recent() {
+        let mgr = in_memory_manager().await;
+        for i in 0..5 {
+            mgr.store(&format!("Memory {i}"), MemoryKind::Episodic, "test", 0.5)
+                .await
+                .unwrap();
+        }
+        let recent = mgr.recent(3).await.unwrap();
+        assert_eq!(recent.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_mark_accessed() {
+        let mgr = in_memory_manager().await;
+        let id = mgr
+            .store("Test memory", MemoryKind::Episodic, "test", 0.5)
+            .await
+            .unwrap();
+        mgr.mark_accessed(&[id]).await.unwrap(); // should not error
+    }
+
+    #[tokio::test]
+    async fn test_find_episodic_clusters_empty() {
+        let mgr = in_memory_manager().await;
+        let clusters = mgr.find_episodic_clusters().await.unwrap();
+        assert!(clusters.is_empty());
     }
 }

@@ -62,8 +62,10 @@ impl Agent {
         // 4. Compact context if needed
         self.compact_context_if_needed().await?;
 
-        // 5. Generate response via Claude, running the tool loop until done
-        let executor = tools::ToolExecutor::new(self.llm.clone(), self.config.claude.max_tokens);
+        // 5. Generate response via Claude, running the tool loop until done.
+        //    If the signal client supports streaming (stdio), text is printed live.
+        let stream_cb = self.signal.text_stream_callback();
+        let executor = tools::ToolExecutor::new(self.llm.clone(), self.memory.clone(), self.config.claude.max_tokens);
         let mut messages = {
             let ctx = self.context.read().await;
             ClaudeClient::messages_from_context(&ctx)
@@ -71,20 +73,27 @@ impl Agent {
         let tool_defs = executor.tool_definitions();
         let final_text;
         loop {
-            let resp = self
-                .llm
-                .complete_with_tools(ClaudeRequest {
-                    system: &system_prompt,
-                    messages: messages.clone(),
-                    max_tokens: self.config.claude.max_tokens,
-                    tools: &tool_defs,
-                })
-                .await
-                .context("Claude completion failed")?;
+            let req = ClaudeRequest {
+                system: &system_prompt,
+                messages: messages.clone(),
+                max_tokens: self.config.claude.max_tokens,
+                tools: &tool_defs,
+            };
+            let resp = match stream_cb.clone() {
+                Some(cb) => self.llm.complete_with_tools_streaming(req, cb).await,
+                None => self.llm.complete_with_tools(req).await,
+            }
+            .context("Claude completion failed")?;
 
             if resp.tool_calls.is_empty() {
                 final_text = resp.text;
                 break;
+            }
+
+            // If text was streamed before tool calls (e.g. "Let me check..."),
+            // print a newline so the next streamed segment starts on a fresh line.
+            if stream_cb.is_some() && !resp.text.is_empty() {
+                println!();
             }
 
             // Assistant turn: full blocks (text + tool_use)
@@ -152,9 +161,12 @@ impl Agent {
              Use the retrieved memories above to provide personalized, contextual responses. \
              Reference past conversations naturally when relevant, but don't force it.\n\n\
              ## Tool Use\n\
-             Tools available: shell_exec, file_read, file_write, web_fetch, spawn_subagent.\n\
+             Tools available: shell_exec, file_read, file_write, web_fetch, memory_search, memory_update, memory_delete, spawn_subagent.\n\
              - file_write: if the target already exists OR is a system path (/etc, /usr, /bin, /sbin, /boot, /lib, /sys, /proc), ask the user for confirmation first, then retry with force=true.\n\
              - shell_exec: ask before destructive commands (rm, rmdir, dd, mkfs, etc.).\n\
+             - memory_search: find memories by semantic query — returns IDs, content, kind, importance, and pinned status.\n\
+             - memory_update: correct or replace a memory's content (re-embeds automatically), adjust its importance, or pin/unpin it. Use when something you know has changed rather than gone away entirely.\n\
+             - memory_delete: permanently remove a memory that is fully obsolete. Pinned memories CAN be deleted — use this when information is no longer true at all.\n\
              - spawn_subagent: delegate a self-contained task to an isolated sub-agent to preserve \
 the main context window. The sub-agent has shell_exec, file_read, file_write, and \
 web_fetch but cannot spawn further sub-agents.\n\
@@ -330,21 +342,14 @@ mod tests {
     fn test_config() -> AppConfig {
         AppConfig {
             soul_path: "/tmp/soul.yaml".to_string(),
+            db_path: ":memory:".to_string(),
+            primary_contact: "user".to_string(),
+            anthropic_api_key: None,
             claude: ClaudeConfig {
                 model: "test".to_string(),
                 max_tokens: 100,
                 context_limit: 200000,
                 compaction_threshold: 0.75,
-            },
-            voyage: VoyageConfig {
-                model: "test".to_string(),
-                dimensions: 1024,
-            },
-            signal: SignalConfig {
-                base_url: "http://localhost:8080".to_string(),
-                phone_number: "+15551234567".to_string(),
-                allowed_senders: vec!["+15559876543".to_string()],
-                poll_interval_secs: 1,
             },
             memory: MemoryConfig {
                 max_memories: 1000,
@@ -354,10 +359,7 @@ mod tests {
                 ttl_days_episodic: 90.0,
             },
             heartbeat: HeartbeatConfig { interval_secs: 3600 },
-            qdrant: QdrantConfig {
-                url: "http://localhost:6334".to_string(),
-                collection: "memories".to_string(),
-            },
+            poll_interval_secs: 0,
         }
     }
 
@@ -376,10 +378,10 @@ mod tests {
     // Qdrant. Full agent integration tests live in tests/agent_test.rs.
 
     #[test]
-    fn test_config_has_no_db_path() {
+    fn test_config_db_path() {
         let cfg = test_config();
-        assert_eq!(cfg.qdrant.url, "http://localhost:6334");
-        assert_eq!(cfg.qdrant.collection, "memories");
+        assert_eq!(cfg.db_path, ":memory:");
+        assert_eq!(cfg.primary_contact, "user");
     }
 
     #[test]
@@ -414,12 +416,15 @@ mod tests {
             let base = s.to_system_prompt();
             let memory_section = MemoryManager::format_memories_for_prompt(&[]);
             format!(
-                "{base}\n\n{memory_section}\n\nUse the retrieved memories above to provide personalized, contextual responses. Reference past conversations naturally when relevant, but don't force it.\n\n## Tool Use\nTools available: shell_exec, file_read, file_write, web_fetch, spawn_subagent."
+                "{base}\n\n{memory_section}\n\nUse the retrieved memories above to provide personalized, contextual responses. Reference past conversations naturally when relevant, but don't force it.\n\n## Tool Use\nTools available: shell_exec, file_read, file_write, web_fetch, memory_search, memory_update, memory_delete, spawn_subagent."
             )
         };
         assert!(prompt.contains("## Tool Use"));
         assert!(prompt.contains("shell_exec"));
         assert!(prompt.contains("file_write"));
+        assert!(prompt.contains("memory_search"));
+        assert!(prompt.contains("memory_update"));
+        assert!(prompt.contains("memory_delete"));
         assert!(prompt.contains("spawn_subagent"));
     }
 }
