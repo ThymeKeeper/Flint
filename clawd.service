@@ -1,0 +1,20 @@
+[Unit]
+Description=Clawd personal AI agent daemon
+After=network.target signal-cli.service
+Requires=signal-cli.service
+
+[Service]
+Type=simple
+User=clawd
+EnvironmentFile=/etc/clawd/clawd.env
+ExecStart=/usr/local/bin/clawd --config /etc/clawd/config.toml
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/clawd
+StandardOutput=journal
+SyslogIdentifier=clawd
+
+[Install]
+WantedBy=multi-user.target

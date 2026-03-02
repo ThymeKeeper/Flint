@@ -1,0 +1,33 @@
+soul_path = "/etc/clawd/soul.yaml"
+
+[claude]
+# api_key loaded from ANTHROPIC_API_KEY env var
+model = "claude-opus-4-6"
+max_tokens = 4096
+context_limit = 200000
+compaction_threshold = 0.75
+
+[voyage]
+# api_key loaded from VOYAGE_API_KEY env var
+model = "voyage-3"
+dimensions = 1024
+
+[signal]
+base_url = "http://localhost:8080"
+phone_number = "+15551234567"
+allowed_senders = ["+15559876543"]
+poll_interval_secs = 5
+
+[memory]
+max_memories = 10000
+top_k_retrieval = 10
+importance_decay_days = 30.0
+min_importance_to_keep = 0.1
+ttl_days_episodic = 90
+
+[heartbeat]
+interval_secs = 3600
+
+[qdrant]
+url = "http://localhost:6334"
+collection = "memories"
