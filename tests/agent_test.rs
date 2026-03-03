@@ -9,8 +9,11 @@ use clawd::agent::Agent;
 use clawd::claude::mock::MockLlm;
 use clawd::config::*;
 use clawd::embeddings::mock::MockEmbeddingClient;
+use clawd::jobs::BackgroundJobStore;
 use clawd::memory::MemoryManager;
 use clawd::signal::mock::MockSignalClient;
+use clawd::skills::SkillManager;
+use clawd::tasks::TaskManager;
 
 fn test_config() -> AppConfig {
     AppConfig {
@@ -63,7 +66,10 @@ async fn build_agent(llm_responses: Vec<String>) -> (Arc<Agent>, Arc<MockSignalC
     let llm = Arc::new(MockLlm::new(llm_responses));
     let signal = Arc::new(MockSignalClient::new(vec!["user".to_string()]));
     let soul = Arc::new(RwLock::new(test_soul()));
-    let agent = Arc::new(Agent::new(soul, llm, memory, signal.clone(), config));
+    let tasks = Arc::new(TaskManager::in_memory().await.unwrap());
+    let skills = Arc::new(SkillManager::in_memory().await.unwrap());
+    let (jobs, _) = BackgroundJobStore::new();
+    let agent = Arc::new(Agent::new(soul, llm, memory, tasks, skills, jobs, signal.clone(), config));
     (agent, signal)
 }
 

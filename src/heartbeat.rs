@@ -1,28 +1,28 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
-use crate::claude::{ApiMessage, ClaudeRequest, LlmClient, MessageContent};
-use crate::config::{AppConfig, Soul};
-use crate::memory::{MemoryKind, MemoryManager, MemoryRef};
+use crate::claude::{ApiMessage, ClaudeRequest, ContentBlock, LlmClient, MessageContent};
+use crate::config::AppConfig;
+use crate::memory::MemoryManager;
 use crate::signal::SignalClient;
+use crate::tasks::{TaskEntry, TaskLifecycleEvent, TaskManager, TaskRunOutput, TaskRunState};
+use crate::tools::ToolExecutor;
 
 // ---------------------------------------------------------------------------
 // Heartbeat loop
 // ---------------------------------------------------------------------------
 
-/// Run the heartbeat loop forever, firing every `config.heartbeat.interval_secs` seconds.
+/// Run the heartbeat loop forever.
 ///
-/// Each heartbeat:
-///   1. Maintenance:    decay importance, prune old memories
-///   2. Consolidation:  cluster similar episodics → synthesize → semantic
-///   3. Reflection:     Claude reflects on recent memories
-///   4. Proactive:      optionally send a message to the primary contact
+/// Each tick:
+///   1. Maintenance — decay importance, prune old memories (DB-only, no LLM)
+///   2. Tasks       — find due tasks, run each via an isolated LLM call,
+///                    handle lifecycle events (auto-pause, expiry, one-shot)
 pub async fn run_heartbeat(
-    soul: Arc<RwLock<Soul>>,
-    llm: Arc<dyn LlmClient>,
     memory: Arc<MemoryManager>,
+    tasks: Arc<TaskManager>,
+    llm: Arc<dyn LlmClient>,
     signal: Arc<dyn SignalClient>,
     config: AppConfig,
 ) {
@@ -34,21 +34,14 @@ pub async fn run_heartbeat(
         tokio::time::sleep(interval).await;
         info!("Heartbeat firing");
 
-        // 1. Maintenance
-        if let Err(e) = run_maintenance(&memory).await {
+        if let Err(e) = run_maintenance(&memory, config.heartbeat.interval_secs).await {
             error!("Heartbeat maintenance failed: {e:#}");
         }
 
-        // 2. Consolidation
-        if let Err(e) = run_consolidation(&memory, &llm).await {
-            error!("Heartbeat consolidation failed: {e:#}");
-        }
-
-        // 3. Reflection + 4. Proactive messaging
-        match run_reflection(&soul, &llm, &memory, &signal, &config).await {
-            Ok(Some(reflection)) => info!("Heartbeat reflection: {}", truncate(&reflection, 120)),
-            Ok(None) => {}
-            Err(e) => error!("Heartbeat reflection failed: {e:#}"),
+        if let Err(e) =
+            run_due_tasks(&tasks, &llm, &memory, &signal, &config).await
+        {
+            error!("Heartbeat task execution failed: {e:#}");
         }
 
         info!("Heartbeat complete");
@@ -56,12 +49,12 @@ pub async fn run_heartbeat(
 }
 
 // ---------------------------------------------------------------------------
-// Phase 1: Maintenance
+// Phase 1: Maintenance (DB-only, no LLM)
 // ---------------------------------------------------------------------------
 
-async fn run_maintenance(memory: &MemoryManager) -> Result<()> {
+async fn run_maintenance(memory: &MemoryManager, interval_secs: u64) -> Result<()> {
     info!("Heartbeat: running maintenance");
-    let decayed = memory.decay().await?;
+    let decayed = memory.decay(interval_secs).await?;
     info!("Decayed {decayed} memories");
     let pruned = memory.prune().await?;
     info!("Pruned {pruned} memories");
@@ -71,51 +64,85 @@ async fn run_maintenance(memory: &MemoryManager) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 2: Consolidation
+// Phase 2: Task execution
 // ---------------------------------------------------------------------------
 
-async fn run_consolidation(memory: &MemoryManager, llm: &Arc<dyn LlmClient>) -> Result<()> {
-    info!("Heartbeat: running consolidation");
-    let clusters = memory.find_episodic_clusters().await?;
-    if clusters.is_empty() {
-        info!("No episodic clusters found");
+async fn run_due_tasks(
+    tasks: &TaskManager,
+    llm: &Arc<dyn LlmClient>,
+    memory: &Arc<MemoryManager>,
+    signal: &Arc<dyn SignalClient>,
+    config: &AppConfig,
+) -> Result<()> {
+    let due = tasks.due().await?;
+    if due.is_empty() {
         return Ok(());
     }
-    info!("Found {} clusters for consolidation", clusters.len());
+    info!("Heartbeat: {} task(s) due", due.len());
 
-    for cluster in &clusters {
-        let cluster_text = cluster
-            .iter()
-            .map(|m| m.content.as_str())
-            .collect::<Vec<_>>()
-            .join("\n- ");
+    for task in &due {
+        info!("Running task '{}' ({})", task.id, truncate(&task.description, 60));
 
-        match llm
-            .complete(ClaudeRequest {
-                system: "You synthesize memories. Be concise and factual.",
-                messages: vec![ApiMessage {
-                    role: "user".to_string(),
-                    content: MessageContent::Text(format!(
-                        "Synthesize these related episodic memories into one concise \
-                         semantic memory:\n- {cluster_text}\n\nReturn only the synthesized text."
-                    )),
-                }],
-                max_tokens: 500,
-                tools: &[],
-            })
-            .await
-        {
-            Ok(synthesis) => {
-                let avg_importance: f64 =
-                    cluster.iter().map(|m| m.importance).sum::<f64>() / cluster.len() as f64;
-                memory
-                    .store(&synthesis, MemoryKind::Semantic, "consolidation", (avg_importance + 0.1).min(1.0))
-                    .await?;
-                let ids: Vec<String> = cluster.iter().map(|m| m.id.clone()).collect();
-                memory.delete(&ids).await?;
-                info!("Consolidated {} episodic memories into semantic", cluster.len());
+        let output =
+            match execute_task(task, llm, memory, config.claude.max_tokens).await {
+                Ok(o) => o,
+                Err(e) => {
+                    warn!("Task '{}' execution error: {e:#}", task.id);
+                    // Treat errors as nothing_to_do to avoid infinite failure loops.
+                    TaskRunOutput {
+                        state: TaskRunState::NothingToDo,
+                        reason: format!("Execution error: {e:#}"),
+                        message: None,
+                    }
+                }
+            };
+
+        info!(
+            "Task '{}' → {:?}: {}",
+            task.id,
+            output.state,
+            truncate(&output.reason, 80)
+        );
+
+        // Send the message to the user if the task produced one.
+        if let Some(msg) = &output.message {
+            if let Err(e) = signal.send(&config.primary_contact, msg).await {
+                error!("Failed to send task message to {}: {e:#}", config.primary_contact);
             }
-            Err(e) => warn!("Failed to synthesize cluster: {e:#}"),
+        }
+
+        // Update lifecycle state and react to any events.
+        match tasks.record_result(task, &output.state).await {
+            Ok(TaskLifecycleEvent::Continue) => {}
+
+            Ok(TaskLifecycleEvent::AutoPaused { description, idle_count }) => {
+                info!("Task auto-paused after {idle_count} idle runs: {description}");
+                let notice = format!(
+                    "⏸ I paused a background task after {idle_count} consecutive runs \
+                     with nothing to report:\n\n\"{description}\"\n\n\
+                     Reply 'resume task {id}' or use list_tasks to manage it.",
+                    id = task.id
+                );
+                if let Err(e) = signal.send(&config.primary_contact, &notice).await {
+                    error!("Failed to send auto-pause notice: {e:#}");
+                }
+            }
+
+            Ok(TaskLifecycleEvent::Expired { description }) => {
+                info!("Task expired: {description}");
+                let notice = format!(
+                    "⏰ A scheduled task has expired and been stopped:\n\n\"{description}\""
+                );
+                if let Err(e) = signal.send(&config.primary_contact, &notice).await {
+                    error!("Failed to send expiry notice: {e:#}");
+                }
+            }
+
+            Ok(TaskLifecycleEvent::OneShot { description }) => {
+                info!("One-shot task completed: {description}");
+            }
+
+            Err(e) => error!("Failed to record task result: {e:#}"),
         }
     }
 
@@ -123,107 +150,157 @@ async fn run_consolidation(memory: &MemoryManager, llm: &Arc<dyn LlmClient>) -> 
 }
 
 // ---------------------------------------------------------------------------
-// Phase 3 + 4: Reflection and proactive messaging
+// Task runner — isolated LLM tool loop
 // ---------------------------------------------------------------------------
 
-async fn run_reflection(
-    soul: &Arc<RwLock<Soul>>,
+/// System prompt that teaches the task runner about the three states.
+const TASK_RUNNER_SYSTEM: &str = "\
+You are an autonomous task executor for a personal AI daemon. \
+Execute the assigned task using available tools, then return a single JSON object.
+
+## Required output format
+Your FINAL message must be ONLY this JSON — no prose around it:
+{
+  \"state\": \"acted\" | \"still_waiting\" | \"nothing_to_do\",
+  \"reason\": \"Brief explanation of what you found or did\",
+  \"message\": \"Message to send to the user, or null\"
+}
+
+## State definitions — choose carefully
+
+### \"acted\"
+You completed meaningful work or found something worth reporting.
+- Found new information the user would want to know
+- Completed an action (command run, file written, data fetched and processed)
+- The specific condition being monitored has now occurred
+→ Set `message` to a clear, user-facing summary. Resets the idle counter.
+
+### \"still_waiting\"
+Nothing happened yet, but you are actively monitoring for a SPECIFIC expected future event.
+- You checked and the event has not occurred yet — but you are confident it will
+- Examples: no game release date announced yet, package not yet delivered,
+  website not yet updated, PR not yet merged
+- You can clearly articulate what you are waiting for
+→ Set `message` to null. The idle counter does NOT increment — task stays alive indefinitely.
+Only use this state when there is a concrete, identifiable future event you expect to occur.
+
+### \"nothing_to_do\"
+No meaningful action was possible and there is no specific future event being awaited.
+- The monitored situation seems to have run its course
+- No clear condition left to wait for
+- Repeated checks have found nothing and there is no reason to expect change
+→ Set `message` to null. Idle counter increments.
+After enough consecutive `nothing_to_do` runs, the task is automatically paused.
+
+## Decision guide
+Ask yourself: \"Is there a specific future event I am confident will eventually occur?\"
+  YES and it hasn't happened yet  → \"still_waiting\"
+  YES and it just happened        → \"acted\"
+  NO but I did something useful   → \"acted\"
+  NO and nothing useful to do     → \"nothing_to_do\"
+
+## Available tools
+shell_exec, file_read, file_write, web_fetch, memory_search, memory_store
+Do NOT schedule new tasks or modify the task list from within a task execution.";
+
+/// Run the LLM tool-loop for a single task and return structured output.
+async fn execute_task(
+    task: &TaskEntry,
     llm: &Arc<dyn LlmClient>,
-    memory: &MemoryManager,
-    signal: &Arc<dyn SignalClient>,
-    config: &AppConfig,
-) -> Result<Option<String>> {
-    info!("Heartbeat: running reflection");
+    memory: &Arc<MemoryManager>,
+    max_tokens: usize,
+) -> Result<TaskRunOutput> {
+    let executor = ToolExecutor::for_task_runner(llm.clone(), memory.clone(), max_tokens);
+    let tool_defs = executor.task_runner_tool_definitions();
 
-    let recent = memory.recent(20).await?;
-    let memories_text = format_memories_for_reflection(&recent);
-
-    let soul_guard = soul.read().await;
-    let prompt = format!(
-        "{}\n\n## Recent Memories\n{memories_text}",
-        soul_guard.heartbeat_prompt
+    let user_msg = format!(
+        "Execute this task: {}\n\nContext:\n- Run #{}\n- Consecutive idle runs: {}\n- Last run: {}",
+        task.description,
+        task.run_count + 1,
+        task.idle_count,
+        task.last_run
+            .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+            .unwrap_or_else(|| "never".to_string()),
     );
 
-    let response = llm
-        .complete(ClaudeRequest {
-            system: &format!(
-                "You are {}, reflecting during a periodic heartbeat.",
-                soul_guard.name
-            ),
-            messages: vec![ApiMessage {
-                role: "user".to_string(),
-                content: MessageContent::Text(prompt),
-            }],
-            max_tokens: 1000,
-            tools: &[],
-        })
-        .await?;
+    let mut messages = vec![ApiMessage {
+        role: "user".to_string(),
+        content: MessageContent::Text(user_msg),
+    }];
 
-    match parse_reflection_response(&response) {
-        Some((reflection, proactive_message)) => {
-            memory
-                .store(&reflection, MemoryKind::Reflection, "heartbeat", 0.6)
-                .await?;
-            info!("Stored reflection memory");
+    let final_text = loop {
+        let resp = llm
+            .complete_with_tools(ClaudeRequest {
+                system: TASK_RUNNER_SYSTEM,
+                messages: messages.clone(),
+                max_tokens,
+                tools: &tool_defs,
+            })
+            .await
+            .context("task runner LLM call failed")?;
 
-            if let Some(msg) = &proactive_message {
-                let contact = &config.primary_contact;
-                info!("Sending proactive message to {contact}");
-                if let Err(e) = signal.send(contact, msg).await {
-                    error!("Failed to send proactive message: {e:#}");
-                }
+        if resp.tool_calls.is_empty() {
+            break resp.text;
+        }
+
+        messages.push(ApiMessage {
+            role: "assistant".to_string(),
+            content: MessageContent::Blocks(resp.raw_blocks),
+        });
+
+        let mut results = Vec::new();
+        for tc in &resp.tool_calls {
+            let output = executor.execute(&tc.name, &tc.input).await;
+            results.push(ContentBlock::ToolResult {
+                tool_use_id: tc.id.clone(),
+                content: output,
+            });
+        }
+
+        messages.push(ApiMessage {
+            role: "user".to_string(),
+            content: MessageContent::Blocks(results),
+        });
+    };
+
+    parse_task_output(&final_text)
+}
+
+fn parse_task_output(text: &str) -> Result<TaskRunOutput> {
+    let trimmed = text.trim();
+    let v: serde_json::Value = serde_json::from_str(trimmed)
+        .or_else(|_| {
+            if let (Some(s), Some(e)) = (trimmed.find('{'), trimmed.rfind('}')) {
+                serde_json::from_str(&trimmed[s..=e])
+            } else {
+                Err(serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "no JSON object",
+                )))
             }
+        })
+        .unwrap_or_else(|_| {
+            warn!("Task runner returned non-JSON; treating as nothing_to_do");
+            serde_json::json!({
+                "state": "nothing_to_do",
+                "reason": trimmed,
+                "message": null
+            })
+        });
 
-            Ok(Some(reflection))
-        }
-        None => {
-            warn!("Could not parse reflection JSON; storing raw response");
-            memory
-                .store(&response, MemoryKind::Reflection, "heartbeat", 0.5)
-                .await?;
-            Ok(Some(response))
-        }
-    }
+    Ok(TaskRunOutput {
+        state: TaskRunState::from_str(v["state"].as_str().unwrap_or("nothing_to_do")),
+        reason: v["reason"].as_str().unwrap_or("").to_string(),
+        message: v["message"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string()),
+    })
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-fn parse_reflection_response(response: &str) -> Option<(String, Option<String>)> {
-    let trimmed = response.trim();
-    // Try direct parse
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
-        return extract_reflection_fields(&v);
-    }
-    // Try to find embedded JSON object
-    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&trimmed[start..=end]) {
-            return extract_reflection_fields(&v);
-        }
-    }
-    None
-}
-
-fn extract_reflection_fields(v: &serde_json::Value) -> Option<(String, Option<String>)> {
-    let reflection = v.get("reflection")?.as_str()?.to_string();
-    let proactive = v
-        .get("proactive_message")
-        .and_then(|p| if p.is_null() { None } else { p.as_str().map(|s| s.to_string()) });
-    Some((reflection, proactive))
-}
-
-fn format_memories_for_reflection(memories: &[MemoryRef]) -> String {
-    if memories.is_empty() {
-        return "[No recent memories]".to_string();
-    }
-    memories
-        .iter()
-        .enumerate()
-        .map(|(i, m)| format!("{}. [{}] {}", i + 1, m.kind.as_str(), m.content))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
 
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
@@ -242,63 +319,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_reflection_valid() {
-        let json = r#"{"reflection": "Interesting patterns.", "proactive_message": null}"#;
-        let (reflection, proactive) = parse_reflection_response(json).unwrap();
-        assert_eq!(reflection, "Interesting patterns.");
-        assert!(proactive.is_none());
+    fn test_parse_task_output_acted() {
+        let json = r#"{"state":"acted","reason":"Found update.","message":"New version released!"}"#;
+        let out = parse_task_output(json).unwrap();
+        assert_eq!(out.state, TaskRunState::Acted);
+        assert_eq!(out.message, Some("New version released!".to_string()));
     }
 
     #[test]
-    fn test_parse_reflection_with_message() {
-        let json =
-            r#"{"reflection": "Good progress.", "proactive_message": "How did the project go?"}"#;
-        let (reflection, proactive) = parse_reflection_response(json).unwrap();
-        assert_eq!(reflection, "Good progress.");
-        assert_eq!(proactive, Some("How did the project go?".to_string()));
+    fn test_parse_task_output_still_waiting() {
+        let json = r#"{"state":"still_waiting","reason":"No announcement yet.","message":null}"#;
+        let out = parse_task_output(json).unwrap();
+        assert_eq!(out.state, TaskRunState::StillWaiting);
+        assert!(out.message.is_none());
     }
 
     #[test]
-    fn test_parse_reflection_embedded_json() {
-        let text = r#"Here is my reflection: {"reflection": "All well.", "proactive_message": null}"#;
-        let (reflection, _) = parse_reflection_response(text).unwrap();
-        assert_eq!(reflection, "All well.");
+    fn test_parse_task_output_nothing_to_do() {
+        let json = r#"{"state":"nothing_to_do","reason":"Nothing changed.","message":null}"#;
+        let out = parse_task_output(json).unwrap();
+        assert_eq!(out.state, TaskRunState::NothingToDo);
     }
 
     #[test]
-    fn test_parse_reflection_invalid() {
-        assert!(parse_reflection_response("not json").is_none());
+    fn test_parse_task_output_embedded_json() {
+        let text = r#"Here is my result: {"state":"acted","reason":"Done.","message":"All good!"}"#;
+        let out = parse_task_output(text).unwrap();
+        assert_eq!(out.state, TaskRunState::Acted);
     }
 
     #[test]
-    fn test_format_memories_for_reflection_empty() {
-        assert_eq!(format_memories_for_reflection(&[]), "[No recent memories]");
-    }
-
-    #[test]
-    fn test_format_memories_for_reflection() {
-        let mems = vec![
-            MemoryRef {
-                id: "a".to_string(),
-                content: "User discussed Rust".to_string(),
-                kind: MemoryKind::Episodic,
-                importance: 0.8,
-                similarity: 1.0,
-                pinned: false,
-                created_at: chrono::Utc::now(),
-            },
-            MemoryRef {
-                id: "b".to_string(),
-                content: "Prefers concise comms".to_string(),
-                kind: MemoryKind::Semantic,
-                importance: 0.9,
-                similarity: 1.0,
-                pinned: false,
-                created_at: chrono::Utc::now(),
-            },
-        ];
-        let result = format_memories_for_reflection(&mems);
-        assert!(result.contains("1. [episodic] User discussed Rust"));
-        assert!(result.contains("2. [semantic] Prefers concise comms"));
+    fn test_parse_task_output_non_json_fallback() {
+        let out = parse_task_output("I did some stuff but forgot the format").unwrap();
+        assert_eq!(out.state, TaskRunState::NothingToDo);
     }
 }

@@ -71,7 +71,7 @@ async fn test_mark_accessed() {
         .store("Test memory", MemoryKind::Episodic, "test", 0.5)
         .await
         .unwrap();
-    manager.mark_accessed(&[id]).await.unwrap();
+    manager.mark_accessed(&[(id, 0.8)]).await.unwrap();
 }
 
 #[tokio::test]

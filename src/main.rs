@@ -9,9 +9,12 @@ use clawd::claude::ClaudeClient;
 use clawd::config::{AppConfig, Soul};
 use clawd::embeddings::{LocalEmbeddingClient, EMBEDDING_DIM};
 use clawd::heartbeat;
+use clawd::jobs::BackgroundJobStore;
 use clawd::memory::MemoryManager;
 use clawd::setup;
 use clawd::signal::{SignalClient, TuiSignalClient};
+use clawd::skills::SkillManager;
+use clawd::tasks::TaskManager;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -76,6 +79,21 @@ async fn main() -> Result<()> {
     );
     info!("Memory database ready at {}", db_path.display());
 
+    // ── Task + Skill managers (share the same DuckDB connection as memory) ────
+    let tasks = Arc::new(
+        TaskManager::new(memory.connection())
+            .await
+            .context("Failed to initialize task manager")?,
+    );
+    let skills = Arc::new(
+        SkillManager::new(memory.connection())
+            .await
+            .context("Failed to initialize skill manager")?,
+    );
+
+    // ── Background job store ──────────────────────────────────────────────────
+    let (job_store, mut job_notify_rx) = BackgroundJobStore::new();
+
     // ── TUI signal client ─────────────────────────────────────────────────────
     let (tui_channels, user_input_tx, agent_update_rx) = clawd::tui::create_channels();
     let signal_client: Arc<dyn SignalClient> = Arc::new(TuiSignalClient::new(tui_channels));
@@ -94,6 +112,9 @@ async fn main() -> Result<()> {
         soul.clone(),
         llm.clone(),
         memory.clone(),
+        tasks.clone(),
+        skills.clone(),
+        job_store,
         signal_client.clone(),
         config.clone(),
     ));
@@ -102,48 +123,72 @@ async fn main() -> Result<()> {
 
     // ── Heartbeat loop (background) ───────────────────────────────────────────
     {
-        let soul = soul.clone();
-        let llm = llm.clone();
         let memory = memory.clone();
+        let tasks = tasks.clone();
+        let llm = llm.clone();
         let signal = signal_client.clone();
         let cfg = config.clone();
         tokio::spawn(async move {
-            heartbeat::run_heartbeat(soul, llm, memory, signal, cfg).await;
+            heartbeat::run_heartbeat(memory, tasks, llm, signal, cfg).await;
         });
     }
 
     // ── Main message loop ─────────────────────────────────────────────────────
-    let poll_interval =
-        std::time::Duration::from_secs(config.poll_interval_secs);
+    let poll_interval = std::time::Duration::from_secs(config.poll_interval_secs);
     loop {
-        match signal_client.receive().await {
-            Ok(messages) => {
-                for msg in messages {
-                    if !signal_client.is_allowed(&msg.sender) {
-                        warn!("Ignoring message from: {}", msg.sender);
-                        continue;
-                    }
-
-                    match agent.handle_message(&msg.sender, &msg.text).await {
-                        Ok(response) => {
-                            if let Err(e) = signal_client.send(&msg.sender, &response).await {
-                                error!("Failed to send response to {}: {e:#}", msg.sender);
+        tokio::select! {
+            // User / Signal message
+            result = signal_client.receive() => {
+                match result {
+                    Ok(messages) => {
+                        for msg in messages {
+                            if !signal_client.is_allowed(&msg.sender) {
+                                warn!("Ignoring message from: {}", msg.sender);
+                                continue;
                             }
-                        }
-                        Err(e) => {
-                            error!("Failed to handle message from {}: {e:#}", msg.sender);
-                            let _ = signal_client
-                                .send(&msg.sender, "I encountered an error. Please try again.")
-                                .await;
+                            handle_turn(&agent, &signal_client, &msg.sender, &msg.text).await;
                         }
                     }
+                    Err(e) => error!("Failed to receive messages: {e:#}"),
+                }
+                // Drain any job notifications that completed during this turn.
+                while let Ok(notification) = job_notify_rx.try_recv() {
+                    let text = notification.to_agent_text();
+                    signal_client.push_notification(text.clone());
+                    handle_turn(&agent, &signal_client, "system", &text).await;
                 }
             }
-            Err(e) => error!("Failed to receive messages: {e:#}"),
+
+            // Background job completion
+            Some(notification) = job_notify_rx.recv() => {
+                let text = notification.to_agent_text();
+                signal_client.push_notification(text.clone());
+                handle_turn(&agent, &signal_client, "system", &text).await;
+            }
         }
-        // poll_interval is 0 for stdio mode (receive() blocks naturally).
+
+        // poll_interval is 0 for TUI/stdio mode (receive() blocks naturally).
         if poll_interval.as_secs() > 0 {
             tokio::time::sleep(poll_interval).await;
+        }
+    }
+}
+
+async fn handle_turn(
+    agent: &Agent,
+    signal: &Arc<dyn SignalClient>,
+    sender: &str,
+    text: &str,
+) {
+    match agent.handle_message(sender, text).await {
+        Ok(response) => {
+            if let Err(e) = signal.send(sender, &response).await {
+                error!("Failed to send response to {sender}: {e:#}");
+            }
+        }
+        Err(e) => {
+            error!("Failed to handle message from {sender}: {e:#}");
+            let _ = signal.send(sender, "I encountered an error. Please try again.").await;
         }
     }
 }

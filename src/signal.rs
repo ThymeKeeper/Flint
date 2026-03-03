@@ -48,6 +48,24 @@ pub trait SignalClient: Send + Sync {
     fn text_stream_callback(&self) -> Option<Arc<dyn Fn(String) + Send + Sync>> {
         None
     }
+    /// Return a status callback if this transport supports it.
+    /// Called with the tool name just before each tool execution begins.
+    /// Default: None.
+    fn status_callback(&self) -> Option<Arc<dyn Fn(String) + Send + Sync>> {
+        None
+    }
+    /// Return a tool-event callback if this transport supports it.
+    /// Called twice per tool: once with the formatted call line (before
+    /// execution) and once with the formatted result line (after).
+    /// The text is injected as stream chunks so it appears inline in the
+    /// current message.  Default: None.
+    fn tool_event_callback(&self) -> Option<Arc<dyn Fn(String) + Send + Sync>> {
+        None
+    }
+    /// Push a background-job completion notification to the transport.
+    /// For the TUI this adds a System message + agent placeholder to the chat.
+    /// Default: no-op (non-TUI transports handle notification differently).
+    fn push_notification(&self, _text: String) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -306,9 +324,26 @@ impl SignalClient for TuiSignalClient {
     fn text_stream_callback(&self) -> Option<Arc<dyn Fn(String) + Send + Sync>> {
         let tx = self.agent_update_tx.clone();
         Some(Arc::new(move |chunk: String| {
-            // try_send is non-blocking and safe to call from an async context.
             let _ = tx.try_send(crate::tui::AgentUpdate::StreamChunk(chunk));
         }))
+    }
+
+    fn status_callback(&self) -> Option<Arc<dyn Fn(String) + Send + Sync>> {
+        let tx = self.agent_update_tx.clone();
+        Some(Arc::new(move |tool_name: String| {
+            let _ = tx.try_send(crate::tui::AgentUpdate::StatusUpdate(tool_name));
+        }))
+    }
+
+    fn tool_event_callback(&self) -> Option<Arc<dyn Fn(String) + Send + Sync>> {
+        let tx = self.agent_update_tx.clone();
+        Some(Arc::new(move |text: String| {
+            let _ = tx.try_send(crate::tui::AgentUpdate::StreamChunk(text));
+        }))
+    }
+
+    fn push_notification(&self, text: String) {
+        let _ = self.agent_update_tx.try_send(crate::tui::AgentUpdate::JobNotification(text));
     }
 }
 

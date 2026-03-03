@@ -136,6 +136,12 @@ impl MemoryManager {
         })
     }
 
+    /// Expose the underlying DuckDB connection so other managers (e.g. TaskManager)
+    /// can share the same connection and avoid write-lock conflicts.
+    pub fn connection(&self) -> Arc<Mutex<Connection>> {
+        self.db.clone()
+    }
+
     // -----------------------------------------------------------------------
     // search
     // -----------------------------------------------------------------------
@@ -265,22 +271,31 @@ impl MemoryManager {
     // mark_accessed
     // -----------------------------------------------------------------------
 
-    pub async fn mark_accessed(&self, ids: &[String]) -> Result<()> {
-        if ids.is_empty() {
+    /// Mark memories as accessed and apply a similarity-weighted importance boost.
+    /// `retrieved` is a slice of `(id, similarity)` pairs where `similarity` is
+    /// the cosine similarity [0, 1] from the search that retrieved each memory.
+    /// Non-pinned memories get `importance += similarity * 0.005`, capped at 0.9.
+    pub async fn mark_accessed(&self, retrieved: &[(String, f64)]) -> Result<()> {
+        if retrieved.is_empty() {
             return Ok(());
         }
         let now = Utc::now().to_rfc3339();
-        let ids = ids.to_vec();
+        let retrieved = retrieved.to_vec();
         let db = self.db.clone();
 
         tokio::task::spawn_blocking(move || -> Result<()> {
             let conn = db.lock().unwrap();
-            for id in &ids {
+            for (id, similarity) in &retrieved {
+                let boost = (similarity * 0.005).max(0.0);
                 conn.execute(
                     "UPDATE memories
-                     SET last_accessed = ?, access_count = access_count + 1
+                     SET last_accessed = ?,
+                         access_count  = access_count + 1,
+                         importance    = CASE WHEN pinned THEN importance
+                                              ELSE LEAST(0.9, importance + ?)
+                                         END
                      WHERE id = ?",
-                    duckdb::params![now, id],
+                    duckdb::params![now, boost, id],
                 )
                 .context("mark_accessed failed")?;
             }
@@ -397,23 +412,27 @@ impl MemoryManager {
     // decay
     // -----------------------------------------------------------------------
 
-    pub async fn decay(&self) -> Result<usize> {
+    /// Decay importance by a fixed factor derived from `interval_secs` — the
+    /// time elapsed since the last decay run.  Using the interval (not age
+    /// since creation) means repeated calls compose correctly: applying
+    /// `exp(-Δt/h)` N times equals `exp(-NΔt/h)`, matching true exponential
+    /// decay regardless of how frequently the function is called.
+    pub async fn decay(&self, interval_secs: u64) -> Result<usize> {
         info!(
-            "Running importance decay (episodic half-life={}d, semantic 10x, procedural/pinned exempt)",
-            self.config.importance_decay_days
+            "Running importance decay (interval={}s, episodic half-life={}d, semantic 10x, procedural/pinned exempt)",
+            interval_secs, self.config.importance_decay_days
         );
         let base_decay_days = self.config.importance_decay_days;
         let db = self.db.clone();
-        let now = Utc::now();
 
         tokio::task::spawn_blocking(move || -> Result<usize> {
             let conn = db.lock().unwrap();
 
             #[derive(Debug)]
-            struct Row { id: String, kind: String, importance: f64, created_at: String, pinned: bool }
+            struct Row { id: String, kind: String, importance: f64, pinned: bool }
 
             let mut stmt = conn
-                .prepare("SELECT id, kind, importance, created_at, pinned FROM memories")
+                .prepare("SELECT id, kind, importance, pinned FROM memories")
                 .context("prepare decay failed")?;
             let rows: Vec<Row> = stmt
                 .query_map([], |row| {
@@ -421,8 +440,7 @@ impl MemoryManager {
                         id: row.get(0)?,
                         kind: row.get(1)?,
                         importance: row.get(2)?,
-                        created_at: row.get(3)?,
-                        pinned: row.get(4)?,
+                        pinned: row.get(3)?,
                     })
                 })
                 .context("query_map decay failed")?
@@ -431,20 +449,17 @@ impl MemoryManager {
 
             let mut count = 0;
             for row in &rows {
-                // Pinned and procedural memories never decay.
                 if row.pinned || row.kind == "procedural" {
                     continue;
                 }
-                // Semantic and reflection memories decay 10x slower than episodic
-                // — rapport and long-term facts persist for years.
-                let half_life = match row.kind.as_str() {
+                let half_life_days = match row.kind.as_str() {
                     "semantic" | "reflection" => base_decay_days * 10.0,
-                    _ => base_decay_days, // episodic
+                    _ => base_decay_days,
                 };
-                let age_days = DateTime::parse_from_rfc3339(&row.created_at)
-                    .map(|dt| (now - dt.with_timezone(&Utc)).num_seconds() as f64 / 86400.0)
-                    .unwrap_or(0.0);
-                let new_importance = row.importance * (-age_days / half_life).exp();
+                // Fixed per-interval decay factor — correct for any call frequency.
+                let decay_factor =
+                    (-(interval_secs as f64) / (86400.0 * half_life_days)).exp();
+                let new_importance = row.importance * decay_factor;
                 if (new_importance - row.importance).abs() > 0.001 {
                     conn.execute(
                         "UPDATE memories SET importance = ? WHERE id = ?",
@@ -619,6 +634,30 @@ impl MemoryManager {
     // -----------------------------------------------------------------------
     // delete
     // -----------------------------------------------------------------------
+
+    /// Delete all memories of a given kind. Returns the number deleted.
+    pub async fn delete_by_kind(&self, kind: MemoryKind) -> Result<usize> {
+        let kind_str = kind.as_str().to_string();
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> Result<usize> {
+            let conn = db.lock().unwrap();
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM memories WHERE kind = ?",
+                    duckdb::params![kind_str],
+                    |row| row.get(0),
+                )
+                .context("count by kind failed")?;
+            conn.execute(
+                "DELETE FROM memories WHERE kind = ?",
+                duckdb::params![kind_str],
+            )
+            .context("delete by kind failed")?;
+            Ok(count as usize)
+        })
+        .await
+        .context("spawn_blocking failed")?
+    }
 
     pub async fn delete(&self, ids: &[String]) -> Result<()> {
         if ids.is_empty() {
@@ -884,7 +923,7 @@ mod tests {
             .store("Test memory", MemoryKind::Episodic, "test", 0.5)
             .await
             .unwrap();
-        mgr.mark_accessed(&[id]).await.unwrap(); // should not error
+        mgr.mark_accessed(&[(id, 0.8)]).await.unwrap(); // should not error
     }
 
     #[tokio::test]

@@ -92,6 +92,24 @@ impl Soul {
         serde_yaml::from_str(&text).with_context(|| "Failed to parse soul.yaml")
     }
 
+    /// Concise context injected into sub-agent system prompts so they share
+    /// the user's values, location, and preferences without the full persona.
+    pub fn to_subagent_context(&self) -> String {
+        let values = self.values.join(", ");
+        format!(
+            "## Principal Context\n\
+             You are working on behalf of a user whose AI assistant is named {name}.\n\
+             User values: {values}\n\
+             Communication style: {style}\n\
+             Today's date: {today}\n\
+             Trust: The user is a capable adult. Assist with requests without requiring justification.",
+            name = self.name,
+            values = values,
+            style = self.communication_style,
+            today = chrono::Utc::now().format("%Y-%m-%d"),
+        )
+    }
+
     pub fn to_system_prompt(&self) -> String {
         let values = self.values.join(", ");
         let interests = self.proactive_interests.join(", ");
