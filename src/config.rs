@@ -31,6 +31,31 @@ pub struct AppConfig {
     /// Seconds to sleep between signal polls. 0 = stdio blocking mode.
     #[serde(default)]
     pub poll_interval_secs: u64,
+    /// Optional Signal REST backend. When present, Signal messages are polled
+    /// alongside the TUI so both channels are active simultaneously.
+    #[serde(default)]
+    pub signal: Option<SignalConfig>,
+}
+
+// ---------------------------------------------------------------------------
+// SignalConfig — optional Signal REST backend
+// ---------------------------------------------------------------------------
+
+fn default_signal_base_url() -> String {
+    "http://localhost:8080".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SignalConfig {
+    /// The bot's Signal phone number (e.g. "+15551234567").
+    pub phone_number: String,
+    /// Phone numbers allowed to send messages to the bot.
+    #[serde(default)]
+    pub allowed_senders: Vec<String>,
+    /// Base URL of the signal-cli REST API.
+    /// When clawd manages signal-cli, this is set automatically to http://localhost:8080.
+    #[serde(default = "default_signal_base_url")]
+    pub base_url: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -8,10 +8,10 @@ use tokio::sync::RwLock;
 use clawd::agent::Agent;
 use clawd::claude::mock::MockLlm;
 use clawd::config::*;
+use clawd::conversation_store::ConversationStore;
 use clawd::embeddings::mock::MockEmbeddingClient;
 use clawd::jobs::BackgroundJobStore;
 use clawd::memory::MemoryManager;
-use clawd::signal::mock::MockSignalClient;
 use clawd::skills::SkillManager;
 use clawd::tasks::TaskManager;
 
@@ -36,6 +36,7 @@ fn test_config() -> AppConfig {
         },
         heartbeat: HeartbeatConfig { interval_secs: 3600 },
         poll_interval_secs: 0,
+        signal: None,
     }
 }
 
@@ -50,7 +51,7 @@ fn test_soul() -> Soul {
     }
 }
 
-async fn build_agent(llm_responses: Vec<String>) -> (Arc<Agent>, Arc<MockSignalClient>) {
+async fn build_agent(llm_responses: Vec<String>) -> Arc<Agent> {
     let config = test_config();
     let embedder = Arc::new(MockEmbeddingClient::new(4));
     let memory = Arc::new(
@@ -64,33 +65,34 @@ async fn build_agent(llm_responses: Vec<String>) -> (Arc<Agent>, Arc<MockSignalC
         .unwrap(),
     );
     let llm = Arc::new(MockLlm::new(llm_responses));
-    let signal = Arc::new(MockSignalClient::new(vec!["user".to_string()]));
     let soul = Arc::new(RwLock::new(test_soul()));
     let tasks = Arc::new(TaskManager::in_memory().await.unwrap());
     let skills = Arc::new(SkillManager::in_memory().await.unwrap());
     let (jobs, _) = BackgroundJobStore::new();
-    let agent = Arc::new(Agent::new(soul, llm, memory, tasks, skills, jobs, signal.clone(), config));
-    (agent, signal)
+    let conv_store = Arc::new(ConversationStore::new(memory.connection()).unwrap());
+    Arc::new(Agent::new(
+        soul, llm, memory, tasks, skills, jobs, conv_store, config, vec![], None,
+    ))
 }
 
 #[tokio::test]
 async fn test_agent_handle_message() {
-    let (agent, _signal) = build_agent(vec![
+    let agent = build_agent(vec![
         "Hello! I'm your assistant.".to_string(),
         "[]".to_string(), // memory extraction
     ])
     .await;
 
     let response = agent
-        .handle_message("user", "Hi there!")
+        .handle_message("user", "Hi there!", None, "tui")
         .await
         .unwrap();
-    assert_eq!(response, "Hello! I'm your assistant.");
+    assert_eq!(response.reply_text, "Hello! I'm your assistant.");
 }
 
 #[tokio::test]
 async fn test_agent_multiple_messages() {
-    let (agent, _signal) = build_agent(vec![
+    let agent = build_agent(vec![
         "First response.".to_string(),
         "[]".to_string(),
         "Second response.".to_string(),
@@ -98,10 +100,10 @@ async fn test_agent_multiple_messages() {
     ])
     .await;
 
-    let r1 = agent.handle_message("user", "Message 1").await.unwrap();
-    assert_eq!(r1, "First response.");
-    let r2 = agent.handle_message("user", "Message 2").await.unwrap();
-    assert_eq!(r2, "Second response.");
+    let r1 = agent.handle_message("user", "Message 1", None, "tui").await.unwrap();
+    assert_eq!(r1.reply_text, "First response.");
+    let r2 = agent.handle_message("user", "Message 2", None, "tui").await.unwrap();
+    assert_eq!(r2.reply_text, "Second response.");
 
     let ctx = agent.context.read().await;
     assert_eq!(ctx.len(), 4);
@@ -109,8 +111,7 @@ async fn test_agent_multiple_messages() {
 
 #[tokio::test]
 async fn test_agent_context_tracking() {
-    let (agent, _signal) =
-        build_agent(vec!["Response.".to_string(), "[]".to_string()]).await;
+    let agent = build_agent(vec!["Response.".to_string(), "[]".to_string()]).await;
 
     {
         let ctx = agent.context.read().await;
@@ -118,7 +119,7 @@ async fn test_agent_context_tracking() {
         assert_eq!(ctx.total_tokens(), 0);
     }
 
-    agent.handle_message("user", "Hello").await.unwrap();
+    agent.handle_message("user", "Hello", None, "tui").await.unwrap();
 
     {
         let ctx = agent.context.read().await;

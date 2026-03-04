@@ -1,21 +1,13 @@
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
-// ---------------------------------------------------------------------------
-// SignalConfig — kept here (no longer part of AppConfig)
-// ---------------------------------------------------------------------------
+use crate::observer::AgentObserver;
 
-/// Configuration for the signal-cli REST backend (kept for future use).
-#[derive(Debug, Clone)]
-pub struct SignalConfig {
-    pub base_url: String,
-    pub phone_number: String,
-    pub allowed_senders: Vec<String>,
-    pub poll_interval_secs: u64,
-}
+pub use crate::config::SignalConfig;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -41,27 +33,6 @@ pub trait SignalClient: Send + Sync {
     async fn send(&self, recipient: &str, message: &str) -> Result<()>;
     /// Check if a sender is in the allow list.
     fn is_allowed(&self, sender: &str) -> bool;
-    /// Return a streaming text callback if this transport supports it.
-    /// Called for each text chunk as Claude generates it.
-    /// When Some is returned, `send()` must be a no-op (text was already printed).
-    /// Default: None (non-streaming transports like Signal REST).
-    fn text_stream_callback(&self) -> Option<Arc<dyn Fn(String) + Send + Sync>> {
-        None
-    }
-    /// Return a status callback if this transport supports it.
-    /// Called with the tool name just before each tool execution begins.
-    /// Default: None.
-    fn status_callback(&self) -> Option<Arc<dyn Fn(String) + Send + Sync>> {
-        None
-    }
-    /// Return a tool-event callback if this transport supports it.
-    /// Called twice per tool: once with the formatted call line (before
-    /// execution) and once with the formatted result line (after).
-    /// The text is injected as stream chunks so it appears inline in the
-    /// current message.  Default: None.
-    fn tool_event_callback(&self) -> Option<Arc<dyn Fn(String) + Send + Sync>> {
-        None
-    }
     /// Push a background-job completion notification to the transport.
     /// For the TUI this adds a System message + agent placeholder to the chat.
     /// Default: no-op (non-TUI transports handle notification differently).
@@ -119,10 +90,9 @@ struct SendRequest {
 #[async_trait]
 impl SignalClient for SignalRestClient {
     async fn receive(&self) -> Result<Vec<IncomingMessage>> {
-        let url = format!(
-            "{}/v1/receive/{}",
-            self.base_url, self.phone_number
-        );
+        // The + in E.164 numbers must be percent-encoded in the URL path.
+        let encoded_number = self.phone_number.replace('+', "%2B");
+        let url = format!("{}/v1/receive/{}", self.base_url, encoded_number);
 
         debug!("Polling Signal for messages: {url}");
 
@@ -219,6 +189,250 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// signal-cli TCP JSON-RPC client
+// ---------------------------------------------------------------------------
+
+/// Communicates with signal-cli via its JSON-RPC TCP socket (`daemon --tcp`).
+///
+/// signal-cli in `--receive-mode on-start` (the default) actively receives
+/// messages in the background and **pushes them as JSON-RPC notifications**
+/// to every connected client. We maintain one persistent listener connection
+/// and forward notifications to an in-process channel; `receive()` blocks
+/// until a message arrives. Outgoing `send()` calls open short-lived
+/// connections to issue a JSON-RPC `send` request.
+pub struct SignalTcpRpcClient {
+    addr: String,
+    allowed_senders: Vec<String>,
+    message_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<IncomingMessage>>>,
+    next_id: Arc<AtomicU64>,
+}
+
+impl SignalTcpRpcClient {
+    pub fn new(config: &SignalConfig) -> Self {
+        let addr = crate::signal_daemon::daemon_tcp_addr();
+        let (tx, rx) = tokio::sync::mpsc::channel::<IncomingMessage>(64);
+        // Background task: maintain a persistent connection and forward
+        // incoming message notifications to the channel.
+        tokio::spawn(run_notification_listener(addr.clone(), tx));
+        Self {
+            addr,
+            allowed_senders: config.allowed_senders.clone(),
+            message_rx: Arc::new(tokio::sync::Mutex::new(rx)),
+            next_id: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    /// Open a short-lived connection to send one JSON-RPC request and return
+    /// the result. Incoming notifications on this connection are ignored.
+    async fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpStream;
+
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+            "id": id,
+        });
+        let mut req_bytes = serde_json::to_vec(&request)?;
+        req_bytes.push(b'\n');
+
+        let mut stream = TcpStream::connect(&self.addr)
+            .await
+            .with_context(|| format!("Failed to connect to signal-cli at {}", self.addr))?;
+        stream.write_all(&req_bytes).await?;
+
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+
+        loop {
+            line.clear();
+            let n = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                reader.read_line(&mut line),
+            )
+            .await
+            .context("Timed out waiting for signal-cli response")?
+            .context("signal-cli TCP connection closed")?;
+
+            if n == 0 {
+                bail!("signal-cli TCP connection closed before response");
+            }
+
+            let response: serde_json::Value = match serde_json::from_str(line.trim()) {
+                Ok(v) => v,
+                Err(_) => continue, // malformed line, skip
+            };
+
+            // Skip notifications (no "id") — only match our response.
+            if response.get("id").and_then(|v| v.as_u64()) == Some(id) {
+                if let Some(err) = response.get("error") {
+                    bail!("signal-cli error: {err}");
+                }
+                return Ok(response["result"].clone());
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl SignalClient for SignalTcpRpcClient {
+    /// Block until a Signal message arrives via the persistent notification
+    /// listener, then drain any additional buffered messages and return them.
+    async fn receive(&self) -> Result<Vec<IncomingMessage>> {
+        let mut rx = self.message_rx.lock().await;
+        match rx.recv().await {
+            Some(msg) => {
+                let mut messages = vec![msg];
+                // Drain any additional messages queued simultaneously.
+                while let Ok(m) = rx.try_recv() {
+                    messages.push(m);
+                }
+                debug!("Received {} message(s) from signal-cli", messages.len());
+                Ok(messages)
+            }
+            None => Err(anyhow!("signal-cli notification channel closed")),
+        }
+    }
+
+    async fn send(&self, recipient: &str, message: &str) -> Result<()> {
+        if message.trim().is_empty() {
+            debug!("Suppressed empty Signal message to {recipient}");
+            return Ok(());
+        }
+        debug!(
+            "Sending Signal message to {}: {}",
+            recipient,
+            truncate(message, 50)
+        );
+        self.call(
+            "send",
+            serde_json::json!({
+                "recipient": [recipient],
+                "message": message,
+            }),
+        )
+        .await
+        .context("signal-cli send failed")?;
+        debug!("Signal message sent to {recipient}");
+        Ok(())
+    }
+
+    fn is_allowed(&self, sender: &str) -> bool {
+        self.allowed_senders.iter().any(|s| s == sender)
+    }
+}
+
+/// Background task: connect to signal-cli and forward incoming message
+/// notifications to the channel. Reconnects automatically on disconnect.
+async fn run_notification_listener(
+    addr: String,
+    tx: tokio::sync::mpsc::Sender<IncomingMessage>,
+) {
+    loop {
+        debug!("signal-cli notification listener connecting to {addr}");
+        match listen_for_notifications(&addr, &tx).await {
+            Ok(()) => {
+                debug!("signal-cli notification listener: channel closed, exiting");
+                break;
+            }
+            Err(e) => {
+                warn!("signal-cli notification listener disconnected: {e:#}");
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+        }
+    }
+}
+
+/// Connect once and forward JSON-RPC notifications until the connection drops
+/// or the sender is gone. Returns Ok(()) when the channel receiver is dropped.
+async fn listen_for_notifications(
+    addr: &str,
+    tx: &tokio::sync::mpsc::Sender<IncomingMessage>,
+) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::net::TcpStream;
+
+    let stream = TcpStream::connect(addr)
+        .await
+        .with_context(|| format!("Failed to connect to signal-cli at {addr}"))?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        let n = reader
+            .read_line(&mut line)
+            .await
+            .context("signal-cli TCP read error")?;
+        if n == 0 {
+            bail!("signal-cli TCP connection closed");
+        }
+
+        let value: serde_json::Value = match serde_json::from_str(line.trim()) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("Failed to parse signal-cli notification: {e}");
+                continue;
+            }
+        };
+
+        // JSON-RPC notifications have "method" but no "id".
+        if value.get("id").is_some() || value.get("method").is_none() {
+            continue;
+        }
+
+        // Log every notification at info level so we can see what signal-cli sends.
+        info!("signal-cli notification: {}", line.trim());
+
+        if let Some(msg) = extract_message_from_notification(&value) {
+            if tx.send(msg).await.is_err() {
+                return Ok(()); // receiver dropped
+            }
+        } else {
+            debug!("notification had no extractable data message, skipping");
+        }
+    }
+}
+
+fn extract_message_from_notification(notification: &serde_json::Value) -> Option<IncomingMessage> {
+    let params = notification.get("params")?;
+
+    // signal-cli v0.13+: params.envelope.dataMessage
+    // Some builds: params.envelope at top level, dataMessage inside envelope
+    // Try both layouts.
+    let envelope = params.get("envelope")?;
+
+    let sender = envelope
+        .get("sourceNumber")
+        .or_else(|| envelope.get("source"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())?;
+
+    // dataMessage may be inside envelope or alongside it in params.
+    let data = envelope
+        .get("dataMessage")
+        .or_else(|| params.get("dataMessage"))?;
+
+    let text = data.get("message").and_then(|v| v.as_str())?;
+    if text.is_empty() {
+        return None;
+    }
+
+    let timestamp = data
+        .get("timestamp")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    Some(IncomingMessage {
+        sender,
+        text: text.to_string(),
+        timestamp,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Mock for testing
 // ---------------------------------------------------------------------------
 
@@ -293,6 +507,14 @@ impl TuiSignalClient {
             agent_update_tx: channels.agent_update_tx,
         }
     }
+
+    /// Push persisted conversation history to the TUI before the first render.
+    /// Each entry is (display_role, content) e.g. ("You", "…") or (agent_name, "…").
+    pub fn push_history(&self, turns: Vec<(String, String)>) {
+        let _ = self
+            .agent_update_tx
+            .try_send(crate::tui::AgentUpdate::HistoryLoaded(turns));
+    }
 }
 
 #[async_trait]
@@ -321,29 +543,24 @@ impl SignalClient for TuiSignalClient {
         true
     }
 
-    fn text_stream_callback(&self) -> Option<Arc<dyn Fn(String) + Send + Sync>> {
-        let tx = self.agent_update_tx.clone();
-        Some(Arc::new(move |chunk: String| {
-            let _ = tx.try_send(crate::tui::AgentUpdate::StreamChunk(chunk));
-        }))
-    }
-
-    fn status_callback(&self) -> Option<Arc<dyn Fn(String) + Send + Sync>> {
-        let tx = self.agent_update_tx.clone();
-        Some(Arc::new(move |tool_name: String| {
-            let _ = tx.try_send(crate::tui::AgentUpdate::StatusUpdate(tool_name));
-        }))
-    }
-
-    fn tool_event_callback(&self) -> Option<Arc<dyn Fn(String) + Send + Sync>> {
-        let tx = self.agent_update_tx.clone();
-        Some(Arc::new(move |text: String| {
-            let _ = tx.try_send(crate::tui::AgentUpdate::StreamChunk(text));
-        }))
-    }
-
     fn push_notification(&self, text: String) {
         let _ = self.agent_update_tx.try_send(crate::tui::AgentUpdate::JobNotification(text));
+    }
+}
+
+impl AgentObserver for TuiSignalClient {
+    fn on_text_chunk(&self, chunk: String) {
+        let _ = self.agent_update_tx.try_send(crate::tui::AgentUpdate::StreamChunk(chunk));
+    }
+
+    fn on_tool_start(&self, name: &str) {
+        let _ = self
+            .agent_update_tx
+            .try_send(crate::tui::AgentUpdate::StatusUpdate(name.to_string()));
+    }
+
+    fn on_tool_event(&self, text: String) {
+        let _ = self.agent_update_tx.try_send(crate::tui::AgentUpdate::StreamChunk(text));
     }
 }
 

@@ -49,6 +49,9 @@ pub enum AgentUpdate {
     StatusUpdate(String),
     /// A background job finished. Adds a System message + agent placeholder.
     JobNotification(String),
+    /// Pre-populate the chat with persisted history on startup.
+    /// Each entry is (display_role, content) e.g. ("You", "…") or ("Calcifer", "…").
+    HistoryLoaded(Vec<(String, String)>),
 }
 
 /// Channel endpoints owned by `TuiSignalClient`.
@@ -157,9 +160,17 @@ pub fn run_tui(
                     tool_status = None;
                     if let Some(last) = messages.last_mut() {
                         if last.streaming {
-                            last.text = text;
+                            // Only replace streaming content when final text is non-empty.
+                            // Otherwise keep whatever was accumulated (e.g. tool event lines).
+                            if !text.trim().is_empty() {
+                                last.text = text;
+                            }
                             last.streaming = false;
                         }
+                    }
+                    // Remove trailing agent message if there is nothing to display.
+                    if messages.last().map_or(false, |m| !m.streaming && m.text.trim().is_empty()) {
+                        messages.pop();
                     }
                     if auto_scroll {
                         scroll_up = 0;
@@ -179,6 +190,22 @@ pub fn run_tui(
                         streaming: true,
                     });
                     auto_scroll = true;
+                    scroll_up = 0;
+                }
+                Ok(AgentUpdate::HistoryLoaded(turns)) => {
+                    // Prepend persisted history so the user sees the full
+                    // conversation on startup, including Signal exchanges.
+                    let mut history_msgs: Vec<ChatMessage> = turns
+                        .into_iter()
+                        .map(|(role, content)| ChatMessage {
+                            role,
+                            text: content,
+                            streaming: false,
+                        })
+                        .collect();
+                    history_msgs.append(&mut messages);
+                    messages = history_msgs;
+                    // Stay pinned to bottom so the most recent message is visible.
                     scroll_up = 0;
                 }
                 Err(_) => break,

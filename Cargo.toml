@@ -38,6 +38,9 @@ ratatui = "0.29"
 tui-textarea = { version = "0.7", features = ["crossterm"] }
 arboard = "3"
 fastembed = "5"
+flate2 = "1"
+tar = "0.4"
+ureq = "2"
 
 [build-dependencies]
 ureq = "2"

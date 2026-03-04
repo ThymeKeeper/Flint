@@ -384,6 +384,90 @@ pub fn run_setup_wizard() -> Result<PathBuf> {
     )?;
     let model = model_values[model_idx];
 
+    // ── Signal (optional) ─────────────────────────────────────────────────────
+    let signal_cfg = if prompt_confirm(
+        "connect Signal?",
+        "I can receive and send messages over Signal so you can reach me from\n\
+         your phone when away from this machine.\n\
+         \n\
+         I'll download signal-cli (the official Signal CLI, ~92 MB) and walk\n\
+         you through linking your device. No Docker or extra services needed.\n\
+         \n\
+         Skip for now and add [signal] to config.toml later if you prefer.",
+        false,
+    )? {
+        section("Signal setup");
+        println!(
+            "  {}",
+            dim("I'll download signal-cli and link this device to your Signal account.")
+        );
+        println!();
+
+        // Download the binary.
+        let dl_result = crate::signal_daemon::ensure_signal_cli(&data_dir);
+        match dl_result {
+            Err(e) => {
+                println!();
+                println!("  {} Download failed: {e:#}", amber("~"));
+                println!(
+                    "  {}",
+                    dim("You can set up Signal manually later — add [signal] to config.toml.")
+                );
+                println!();
+                None
+            }
+            Ok(_) => {
+                println!("  {} signal-cli ready.", sage("✓"));
+                println!();
+
+                // Run the link flow.
+                println!("  {}", dim("Open Signal on your phone: Devices → Link New Device"));
+                println!();
+                let link_result = crate::signal_daemon::run_link_flow(&data_dir);
+                match link_result {
+                    Err(e) => {
+                        println!();
+                        println!("  {} Linking failed: {e:#}", amber("~"));
+                        println!(
+                            "  {}",
+                            dim("Run  clawd --setup  again to retry, or add [signal] manually.")
+                        );
+                        println!();
+                        None
+                    }
+                    Ok(phone_number) => {
+                        println!("  {} Device linked.", sage("✓"));
+                        println!();
+
+                        // Ask for allowed senders.
+                        section("who can message me?");
+                        println!(
+                            "  {}",
+                            dim("Your phone number(s) allowed to message the bot.")
+                        );
+                        println!(
+                            "  {}",
+                            dim("Space-separated if multiple (e.g. +15559876543 +15550001111):")
+                        );
+                        println!();
+                        let senders_input: String = Input::with_theme(&CozyTheme)
+                            .with_prompt("  > ")
+                            .interact_text()
+                            .context("Failed to read allowed senders")?;
+                        let allowed_senders: Vec<String> = senders_input
+                            .split_whitespace()
+                            .map(|s| s.to_string())
+                            .collect();
+
+                        Some((phone_number, allowed_senders))
+                    }
+                }
+            }
+        }
+    } else {
+        None
+    };
+
     // ── Write soul.yaml ──────────────────────────────────────────────────────
     let soul_path = data_dir.join("soul.yaml");
     write_soul_yaml(&soul_path, &agent_name, &persona)?;
@@ -391,7 +475,14 @@ pub fn run_setup_wizard() -> Result<PathBuf> {
     // ── Write config.toml ────────────────────────────────────────────────────
     let db_path = data_dir.join("memories.duckdb");
     let config_path = data_dir.join("config.toml");
-    write_config_toml(&config_path, &soul_path, &db_path, anthropic_key.as_deref(), model)?;
+    write_config_toml(
+        &config_path,
+        &soul_path,
+        &db_path,
+        anthropic_key.as_deref(),
+        model,
+        signal_cfg.as_ref().map(|(p, s)| (p.as_str(), s.as_slice())),
+    )?;
 
     // ── Completion ───────────────────────────────────────────────────────────
     println!();
@@ -409,6 +500,9 @@ pub fn run_setup_wizard() -> Result<PathBuf> {
     println!("       {}  {}", dim("config"), dim(&config_path.display().to_string()));
     println!("       {}    {}", dim("soul"), dim(&soul_path.display().to_string()));
     println!("       {}  {}", dim("memory"), dim(&db_path.display().to_string()));
+    if let Some((phone, _)) = &signal_cfg {
+        println!("       {}  {}", dim("signal"), dim(phone));
+    }
     println!();
     rule();
     println!();
@@ -455,14 +549,21 @@ fn write_config_toml(
     db_path: &Path,
     anthropic_key: Option<&str>,
     model: &str,
+    signal: Option<(&str, &[String])>,
 ) -> Result<()> {
     let soul_str = soul_path.to_string_lossy();
     let db_str = db_path.to_string_lossy();
 
+    let primary_contact = signal
+        .and_then(|(_, senders)| senders.first())
+        .map(|s| s.as_str())
+        .unwrap_or("user");
+
     let mut out = format!(
         r#"soul_path = "{soul_str}"
 db_path   = "{db_str}"
-primary_contact = "user"
+primary_contact = "{primary_contact}"
+poll_interval_secs = 3
 "#
     );
 
@@ -493,6 +594,23 @@ ttl_days_episodic = 90.0
 interval_secs = 3600
 "#,
     );
+
+    if let Some((phone_number, allowed_senders)) = signal {
+        let senders_toml = allowed_senders
+            .iter()
+            .map(|s| format!("  \"{s}\""))
+            .collect::<Vec<_>>()
+            .join(",\n");
+        out.push_str(&format!(
+            r#"
+[signal]
+phone_number = "{phone_number}"
+allowed_senders = [
+{senders_toml}
+]
+"#
+        ));
+    }
 
     std::fs::write(path, &out)
         .with_context(|| format!("Failed to write config.toml to {}", path.display()))?;

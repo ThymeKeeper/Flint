@@ -9,6 +9,8 @@ use crate::claude::{
 };
 use crate::jobs::BackgroundJobStore;
 use crate::memory::MemoryManager;
+use crate::observer::AgentObserver;
+use crate::signal::SignalClient;
 use crate::skills::{SkillManager, ALLOWED_SKILL_TOOLS};
 use crate::tasks::TaskManager;
 
@@ -523,6 +525,26 @@ fn spawn_subagent_definition() -> ToolDefinition {
     }
 }
 
+fn signal_send_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "signal_send",
+        description: "Send a proactive Signal message to the primary contact. \
+            Use for task completion notifications, reminders, alerts, or any message \
+            that should arrive on the user's phone unprompted. \
+            Do NOT use shell_exec to invoke signal-cli directly; that will hang.",
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "message": {
+                    "type": "string",
+                    "description": "The message to send"
+                }
+            },
+            "required": ["message"]
+        }),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tool-event formatting helpers
 // ---------------------------------------------------------------------------
@@ -561,6 +583,7 @@ fn format_tool_call(name: &str, input: &Value) -> String {
         "create_skill"   => trunc(input["name"].as_str().unwrap_or(""), 60),
         "update_skill"   => input["id"].as_str().unwrap_or("").to_string(),
         "delete_skill"   => input["id"].as_str().unwrap_or("").to_string(),
+        "signal_send"    => trunc(input["message"].as_str().unwrap_or(""), 60),
         _                => trunc(&input.to_string(), 72),
     };
     if detail.is_empty() {
@@ -581,49 +604,63 @@ fn format_tool_result(result: &str) -> String {
 
 // ---------------------------------------------------------------------------
 
+/// Configuration for constructing a `ToolExecutor`.
+/// Using a struct avoids positional-parameter friction when adding new fields.
+pub struct ToolExecutorConfig {
+    pub llm:             Arc<dyn LlmClient>,
+    pub memory:          Arc<MemoryManager>,
+    pub max_tokens:      usize,
+    pub tasks:           Option<Arc<TaskManager>>,
+    pub skills:          Option<Arc<SkillManager>>,
+    pub job_store:       Option<Arc<BackgroundJobStore>>,
+    pub signal_client:   Option<Arc<dyn SignalClient>>,
+    pub primary_contact: String,
+    pub soul_context:    String,
+    pub is_signal_reply: bool,
+    pub observer:        Option<Arc<dyn AgentObserver>>,
+}
+
 pub struct ToolExecutor {
-    llm:           Arc<dyn LlmClient>,
-    memory:        Arc<MemoryManager>,
-    tasks:         Option<Arc<TaskManager>>,
-    skills:        Option<Arc<SkillManager>>,
-    soul_context:  String,
-    max_tokens:    usize,
-    status_cb:     Option<Arc<dyn Fn(String) + Send + Sync>>,
-    /// Fires twice per tool call: once with the formatted call line before
-    /// execution, once with the formatted result line after.  Used by the TUI
-    /// to inject tool events directly into the streaming message.
-    tool_event_cb: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    llm:            Arc<dyn LlmClient>,
+    memory:         Arc<MemoryManager>,
+    tasks:          Option<Arc<TaskManager>>,
+    skills:         Option<Arc<SkillManager>>,
+    soul_context:   String,
+    max_tokens:     usize,
+    /// Observer for streaming text and tool events — None for non-TUI transports.
+    observer:       Option<Arc<dyn AgentObserver>>,
     /// Background job store — present for the main agent, absent for task runners.
-    job_store:     Option<Arc<BackgroundJobStore>>,
+    job_store:      Option<Arc<BackgroundJobStore>>,
+    /// Signal client for the `signal_send` tool — None when Signal not configured.
+    signal_client:  Option<Arc<dyn SignalClient>>,
+    /// Primary contact phone number (recipient for signal_send).
+    primary_contact: String,
+    /// True when the current conversation arrived via Signal.
+    /// signal_send is suppressed in this case — replies are delivered automatically
+    /// and offering the tool would cause duplicate messages.
+    is_signal_reply: bool,
 }
 
 impl ToolExecutor {
-    /// Full executor for the main agent: includes task + skill management tools.
-    pub fn new(
-        llm: Arc<dyn LlmClient>,
-        memory: Arc<MemoryManager>,
-        tasks: Arc<TaskManager>,
-        skills: Arc<SkillManager>,
-        soul_context: String,
-        max_tokens: usize,
-        status_cb: Option<Arc<dyn Fn(String) + Send + Sync>>,
-        tool_event_cb: Option<Arc<dyn Fn(String) + Send + Sync>>,
-        job_store: Option<Arc<BackgroundJobStore>>,
-    ) -> Self {
+    /// Construct from a `ToolExecutorConfig`. Tasks/skills/jobs may be None
+    /// to restrict the available tool set.
+    pub fn from_config(cfg: ToolExecutorConfig) -> Self {
         Self {
-            llm,
-            memory,
-            tasks: Some(tasks),
-            skills: Some(skills),
-            soul_context,
-            max_tokens,
-            status_cb,
-            tool_event_cb,
-            job_store,
+            llm:             cfg.llm,
+            memory:          cfg.memory,
+            tasks:           cfg.tasks,
+            skills:          cfg.skills,
+            soul_context:    cfg.soul_context,
+            max_tokens:      cfg.max_tokens,
+            observer:        cfg.observer,
+            job_store:       cfg.job_store,
+            signal_client:   cfg.signal_client,
+            primary_contact: cfg.primary_contact,
+            is_signal_reply: cfg.is_signal_reply,
         }
     }
 
-    /// Restricted executor for task runners: no task/skill management, no sub-agents.
+    /// Convenience constructor for task runners: no task/skill management, no observer.
     pub fn for_task_runner(
         llm: Arc<dyn LlmClient>,
         memory: Arc<MemoryManager>,
@@ -636,9 +673,11 @@ impl ToolExecutor {
             skills: None,
             soul_context: String::new(),
             max_tokens,
-            status_cb: None,
-            tool_event_cb: None,
+            observer: None,
             job_store: None,
+            signal_client: None,
+            primary_contact: String::new(),
+            is_signal_reply: false,
         }
     }
 
@@ -652,6 +691,9 @@ impl ToolExecutor {
         }
         if self.skills.is_some() {
             defs.extend(skill_tool_definitions());
+        }
+        if self.signal_client.is_some() && !self.is_signal_reply {
+            defs.push(signal_send_definition());
         }
         defs
     }
@@ -669,11 +711,9 @@ impl ToolExecutor {
     }
 
     pub async fn execute(&self, name: &str, input: &Value) -> String {
-        if let Some(cb) = &self.status_cb {
-            cb(name.to_string());
-        }
-        if let Some(cb) = &self.tool_event_cb {
-            cb(format_tool_call(name, input));
+        if let Some(obs) = &self.observer {
+            obs.on_tool_start(name);
+            obs.on_tool_event(format_tool_call(name, input));
         }
 
         // Background shell execution — spawn and return immediately.
@@ -685,8 +725,8 @@ impl ToolExecutor {
                 let result = format!(
                     "job:{id} started in background — you will be notified when it completes"
                 );
-                if let Some(cb) = &self.tool_event_cb {
-                    cb(format_tool_result(&result));
+                if let Some(obs) = &self.observer {
+                    obs.on_tool_event(format_tool_result(&result));
                 }
                 return result;
             }
@@ -705,10 +745,11 @@ impl ToolExecutor {
             "list_skills"    => self.list_skills().await,
             "update_skill"   => self.update_skill(input).await,
             "delete_skill"   => self.delete_skill(input).await,
+            "signal_send"    => self.signal_send(input).await,
             _ => execute_tool(name, input).await,
         };
-        if let Some(cb) = &self.tool_event_cb {
-            cb(format_tool_result(&result));
+        if let Some(obs) = &self.observer {
+            obs.on_tool_event(format_tool_result(&result));
         }
         result
     }
@@ -989,6 +1030,21 @@ impl ToolExecutor {
         }
     }
 
+    async fn signal_send(&self, input: &Value) -> String {
+        let client = match &self.signal_client {
+            Some(c) => c,
+            None => return "Error: Signal is not configured".to_string(),
+        };
+        let message = match input["message"].as_str() {
+            Some(m) if !m.is_empty() => m,
+            _ => return "Error: missing 'message' field".to_string(),
+        };
+        match client.send(&self.primary_contact, message).await {
+            Ok(()) => format!("Sent to {}", self.primary_contact),
+            Err(e) => format!("Error sending Signal message: {e:#}"),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // spawn_subagent — with soul context injection and optional skill profile
     // -----------------------------------------------------------------------
@@ -1205,14 +1261,26 @@ mod tests {
         );
         let tasks = Arc::new(TaskManager::in_memory().await.unwrap());
         let skills = Arc::new(crate::skills::SkillManager::in_memory().await.unwrap());
-        ToolExecutor::new(llm, memory, tasks, skills, String::new(), 1000, None, None, None)
+        ToolExecutor::from_config(ToolExecutorConfig {
+            llm,
+            memory,
+            max_tokens: 1000,
+            tasks: Some(tasks),
+            skills: Some(skills),
+            job_store: None,
+            signal_client: None,
+            primary_contact: String::new(),
+            soul_context: String::new(),
+            is_signal_reply: false,
+            observer: None,
+        })
     }
 
     #[tokio::test]
     async fn test_executor_tool_definitions() {
         let executor = test_executor().await;
         let defs = executor.tool_definitions();
-        // 4 base + 4 memory + spawn_subagent + 3 task tools + 4 skill tools = 16
+        // 4 base + 4 memory + spawn_subagent + 3 task tools + 4 skill tools = 16 (no signal_send, signal_client is None)
         assert_eq!(defs.len(), 16);
         let names: Vec<_> = defs.iter().map(|d| d.name).collect();
         assert!(names.contains(&"spawn_subagent"));
@@ -1268,7 +1336,19 @@ mod tests {
         );
         let tasks = Arc::new(TaskManager::in_memory().await.unwrap());
         let skills = Arc::new(crate::skills::SkillManager::in_memory().await.unwrap());
-        let executor = ToolExecutor::new(llm, memory, tasks, skills, String::new(), 1000, None, None, None);
+        let executor = ToolExecutor::from_config(ToolExecutorConfig {
+            llm,
+            memory,
+            max_tokens: 1000,
+            tasks: Some(tasks),
+            skills: Some(skills),
+            job_store: None,
+            signal_client: None,
+            primary_contact: String::new(),
+            soul_context: String::new(),
+            is_signal_reply: false,
+            observer: None,
+        });
         let input = serde_json::json!({"task": "summarise /etc/hostname"});
         let result = executor.execute("spawn_subagent", &input).await;
         assert_eq!(result, "sub-agent result");

@@ -6,12 +6,13 @@ use tracing::{debug, info, warn};
 use crate::claude::{ApiMessage, ClaudeClient, ClaudeRequest, ContentBlock, LlmClient, MessageContent};
 use crate::config::{AppConfig, Soul};
 use crate::context::{ConversationContext, Role};
+use crate::conversation_store::{ConversationStore, StoredTurn, ToolLogEntry};
 use crate::jobs::BackgroundJobStore;
 use crate::memory::{MemoryKind, MemoryManager, MemoryRef};
-use crate::signal::SignalClient;
+use crate::observer::AgentObserver;
 use crate::skills::SkillManager;
 use crate::tasks::TaskManager;
-use crate::tools;
+use crate::tools::{self, ToolExecutorConfig};
 
 // ---------------------------------------------------------------------------
 // Agent
@@ -24,12 +25,17 @@ pub struct Agent {
     pub tasks: Arc<TaskManager>,
     pub skills: Arc<SkillManager>,
     pub jobs: Arc<BackgroundJobStore>,
-    pub signal: Arc<dyn SignalClient>,
+    pub conv_store: Arc<ConversationStore>,
     pub context: RwLock<ConversationContext>,
     pub config: AppConfig,
+    /// The Signal channel client (if configured). Used by the `signal_send` tool
+    /// so the agent can proactively send Signal messages to the primary contact.
+    pub signal_client: Option<Arc<dyn crate::signal::SignalClient>>,
 }
 
 impl Agent {
+    /// Create the agent, restoring conversation history from `history` into the
+    /// context so the first turn has full continuity.
     pub fn new(
         soul: Arc<RwLock<Soul>>,
         llm: Arc<dyn LlmClient>,
@@ -37,15 +43,37 @@ impl Agent {
         tasks: Arc<TaskManager>,
         skills: Arc<SkillManager>,
         jobs: Arc<BackgroundJobStore>,
-        signal: Arc<dyn SignalClient>,
+        conv_store: Arc<ConversationStore>,
         config: AppConfig,
+        history: Vec<StoredTurn>,
+        signal_client: Option<Arc<dyn crate::signal::SignalClient>>,
     ) -> Self {
-        let context = ConversationContext::new(config.claude.clone());
-        Self { soul, llm, memory, tasks, skills, jobs, signal, context: RwLock::new(context), config }
+        let mut context = ConversationContext::new(config.claude.clone());
+        for turn in &history {
+            let role = if turn.role == "assistant" { Role::Assistant } else { Role::User };
+            // Prefix Signal user turns so the agent knows which channel they came from.
+            // For assistant turns, rebuild the tool log block so the LLM retains memory
+            // of what tools were called in prior turns.
+            let content = match (turn.role.as_str(), turn.channel.as_str()) {
+                ("user", "signal") => format!("[Signal] {}", turn.content),
+                ("assistant", _)   => rebuild_stored_for_context(&turn.content, &turn.tool_log),
+                _                  => turn.content.clone(),
+            };
+            context.push(role, content);
+        }
+        Self { soul, llm, memory, tasks, skills, jobs, conv_store, context: RwLock::new(context), config, signal_client }
     }
 
     /// Handle an incoming message: retrieve memories, generate response, store memories.
-    pub async fn handle_message(&self, sender: &str, text: &str) -> Result<String> {
+    /// `observer` receives streaming text and tool events (TUI only; None for Signal/REST).
+    /// `channel` is "tui" or "signal" and is persisted alongside each turn.
+    pub async fn handle_message(
+        &self,
+        sender: &str,
+        text: &str,
+        observer: Option<Arc<dyn AgentObserver>>,
+        channel: &str,
+    ) -> Result<AgentResponse> {
         info!("Handling message from {sender}: {}", truncate(text, 80));
 
         // 1. Search for relevant memories
@@ -63,63 +91,73 @@ impl Agent {
         // 2. Build system prompt
         let system_prompt = self.build_system_prompt(&memories).await;
 
-        // 3. Push user message to context
+        // 3. Push user message to context and persist to DB.
+        //    Annotate Signal turns so the agent can identify them in the live context,
+        //    matching the annotations applied when turns are reloaded from DuckDB.
         {
+            let ctx_text = if channel == "signal" {
+                format!("[Signal] {text}")
+            } else {
+                text.to_string()
+            };
             let mut ctx = self.context.write().await;
-            ctx.push(Role::User, text.to_string());
+            ctx.push(Role::User, ctx_text);
+        }
+        if let Err(e) = self.conv_store.push("default", sender, "user", text, channel, &[]) {
+            warn!("Failed to persist user turn: {e:#}");
         }
 
         // 4. Compact context if needed
         self.compact_context_if_needed().await?;
 
         // 5. Generate response via Claude, running the tool loop until done.
-        //    If the signal client supports streaming (stdio), text is printed live.
-        let stream_cb = self.signal.text_stream_callback();
+        //    If an observer is provided (TUI), text is streamed live.
         let soul_context = {
             let soul = self.soul.read().await;
             soul.to_subagent_context()
         };
-        let status_cb = self.signal.status_callback();
-        let tool_event_cb = self.signal.tool_event_callback();
-        let executor = tools::ToolExecutor::new(
-            self.llm.clone(),
-            self.memory.clone(),
-            self.tasks.clone(),
-            self.skills.clone(),
+        let executor = tools::ToolExecutor::from_config(ToolExecutorConfig {
+            llm:             self.llm.clone(),
+            memory:          self.memory.clone(),
+            max_tokens:      self.config.claude.max_tokens,
+            tasks:           Some(self.tasks.clone()),
+            skills:          Some(self.skills.clone()),
+            job_store:       Some(Arc::clone(&self.jobs)),
+            signal_client:   self.signal_client.clone(),
+            primary_contact: self.config.primary_contact.clone(),
             soul_context,
-            self.config.claude.max_tokens,
-            status_cb,
-            tool_event_cb,
-            Some(Arc::clone(&self.jobs)),
-        );
+            is_signal_reply: channel == "signal",
+            observer:        observer.clone(),
+        });
         let mut messages = {
             let ctx = self.context.read().await;
             ClaudeClient::messages_from_context(&ctx)
         };
         let tool_defs = executor.tool_definitions();
-        let final_text;
-        let mut tool_log: Vec<String> = Vec::new();
-        loop {
+        let mut tool_log: Vec<ToolLogEntry> = Vec::new();
+        let final_text = loop {
             let req = ClaudeRequest {
                 system: &system_prompt,
                 messages: messages.clone(),
                 max_tokens: self.config.claude.max_tokens,
                 tools: &tool_defs,
             };
-            let resp = match stream_cb.clone() {
-                Some(cb) => self.llm.complete_with_tools_streaming(req, cb).await,
+            let resp = match observer.clone() {
+                Some(obs) => {
+                    let cb = Arc::new(move |chunk: String| obs.on_text_chunk(chunk));
+                    self.llm.complete_with_tools_streaming(req, cb).await
+                }
                 None => self.llm.complete_with_tools(req).await,
             }
             .context("Claude completion failed")?;
 
             if resp.tool_calls.is_empty() {
-                final_text = resp.text;
-                break;
+                break resp.text;
             }
 
             // If text was streamed before tool calls (e.g. "Let me check..."),
             // print a newline so the next streamed segment starts on a fresh line.
-            if stream_cb.is_some() && !resp.text.is_empty() {
+            if observer.is_some() && !resp.text.is_empty() {
                 println!();
             }
 
@@ -135,7 +173,7 @@ impl Agent {
                 debug!("Executing tool '{}' with input: {}", tc.name, tc.input);
                 let output = executor.execute(&tc.name, &tc.input).await;
                 debug!("Tool '{}' returned: {}", tc.name, truncate(&output, 120));
-                tool_log.push(tool_log_entry(&tc.name, &tc.input, &output));
+                tool_log.push(make_tool_log_entry(&tc.name, &tc.input, &output));
                 results.push(ContentBlock::ToolResult {
                     tool_use_id: tc.id.clone(),
                     content: output,
@@ -147,20 +185,19 @@ impl Agent {
                 role: "user".to_string(),
                 content: MessageContent::Blocks(results),
             });
-        }
+        };
 
-        // 6. Push assistant text + compact tool log to persistent context so the
-        //    next turn retains evidence of what tools were actually called.
+        // 6. Push assistant reply + tool log block to in-memory context (for LLM continuity).
+        //    Persist reply_text and structured tool_log separately to the DB.
         {
             let mut ctx = self.context.write().await;
-            let stored = if tool_log.is_empty() {
-                final_text.clone()
-            } else {
-                let log_lines =
-                    tool_log.iter().map(|l| format!("• {l}")).collect::<Vec<_>>().join("\n");
-                format!("{final_text}\n\n[Tools called this turn — do not repeat these in future turns:\n{log_lines}]")
-            };
+            let stored = rebuild_stored_for_context(&final_text, &tool_log);
             ctx.push(Role::Assistant, stored);
+            if let Err(e) = self.conv_store.push(
+                "default", "assistant", "assistant", &final_text, channel, &tool_log,
+            ) {
+                warn!("Failed to persist assistant turn: {e:#}");
+            }
         }
 
         // 7. Fire-and-forget: post-conversation memory tasks
@@ -182,7 +219,7 @@ impl Agent {
         });
 
         info!("Response generated: {} chars", final_text.len());
-        Ok(final_text)
+        Ok(AgentResponse { reply_text: final_text, tool_log })
     }
 
     /// Build the system prompt from soul + retrieved memories + date + tool guidelines.
@@ -190,13 +227,81 @@ impl Agent {
         let soul = self.soul.read().await;
         let base_prompt = soul.to_system_prompt();
         let memory_section = MemoryManager::format_memories_for_prompt(memories);
+
+        // Inject Signal context so the agent accurately knows its channel status.
+        let signal_section = if let Some(sc) = &self.config.signal {
+            format!(
+                "\n## Channels\n\
+                 You are reachable via two channels:\n\
+                 - **TUI** (local terminal): the primary interactive interface.\n\
+                 - **Signal** (phone: {}): messages from authorised senders arrive automatically \
+                 and your replies are delivered back through Signal automatically. \
+                 You are already linked and the daemon is running.\n\
+                 \n\
+                 When you receive a Signal message, just return your response — it is \
+                 automatically delivered back via Signal. Use `signal_send` only from TUI \
+                 conversations to proactively reach the user on their phone (e.g. task \
+                 completion, reminders, alerts). Do NOT invoke signal-cli via shell_exec — \
+                 a daemon owns the data directory and direct invocations will hang.\n",
+                sc.phone_number
+            )
+        } else {
+            let config_toml = std::path::Path::new(&self.config.soul_path)
+                .parent()
+                .map(|p| p.join("config.toml").to_string_lossy().into_owned())
+                .unwrap_or_else(|| "~/.clawd/config.toml".to_string());
+            format!(
+                "\n## Channels\n\
+                 You currently only have the TUI channel. Signal is not configured.\n\
+                 If the user asks to set up Signal, use the `signal-setup` skill to handle \
+                 the automated part (download + link + QR code). Once the skill returns the \
+                 QR/URI, display it, then guide the user through the rest:\n\
+                 - Wait for them to scan and confirm the device appears in Signal\n\
+                 - Run: `~/.clawd/bin/signal-cli --config ~/.clawd/signal-data listAccounts`\n\
+                 - If that returns a phone number, ask for their own number (allowed sender)\n\
+                 - If listAccounts returns empty or fails, show the raw output and ask the \
+                   user to type their phone number manually — do NOT proceed without it\n\
+                 - Only once you have a confirmed phone number, append EXACTLY this to \
+                   `{config_toml}` (no other fields, no invented field names):\n\
+                   poll_interval_secs = 3\n\
+                   \n\
+                   [signal]\n\
+                   phone_number = \"<the number>\"\n\
+                   allowed_senders = [\"<their number>\"]\n\
+                 - Tell them to restart clawd\n"
+            )
+        };
+
+        let arch_section = "\n## Architecture\n\
+             You are clawd, a persistent AI daemon. Key facts about your own operation:\n\
+             - **Conversation history**: Every turn is persisted to DuckDB. On startup the last \
+             200 turns are loaded into your context, so you have full continuity across restarts. \
+             Do NOT say \"I only know within this session\" — you have durable memory.\n\
+             - **Channel annotations**: Incoming Signal messages are prefixed `[Signal]` in your \
+             context. Turns without this prefix are from the TUI. Use these to accurately report \
+             which channel a conversation belongs to.\n\
+             - **Semantic memory**: Separate from conversation history, important facts are \
+             extracted and stored as embeddings in DuckDB after each exchange. Use \
+             `memory_search` to query them.\n\
+             - **Background tasks**: Scheduled tasks run independently and report via Signal.\n";
+
+        let tool_list = if self.config.signal.is_some() {
+            "shell_exec, file_read, file_write, web_fetch, memory_store, memory_search, \
+             memory_update, memory_delete, spawn_subagent, schedule_task, list_tasks, \
+             delete_task, create_skill, list_skills, update_skill, delete_skill, signal_send."
+        } else {
+            "shell_exec, file_read, file_write, web_fetch, memory_store, memory_search, \
+             memory_update, memory_delete, spawn_subagent, schedule_task, list_tasks, \
+             delete_task, create_skill, list_skills, update_skill, delete_skill."
+        };
+
         format!(
-            "{base_prompt}\n\n\
+            "{base_prompt}{signal_section}{arch_section}\
              {memory_section}\n\n\
              Use the retrieved memories above to provide personalized, contextual responses. \
              Reference past conversations naturally when relevant, but don't force it.\n\n\
              ## Tool Use\n\
-             Tools available: shell_exec, file_read, file_write, web_fetch, memory_store, memory_search, memory_update, memory_delete, spawn_subagent, schedule_task, list_tasks, delete_task, create_skill, list_skills, update_skill, delete_skill.\n\
+             Tools available: {tool_list}\n\
              - file_write: if the target already exists OR is a system path (/etc, /usr, /bin, /sbin, /boot, /lib, /sys, /proc), ask the user for confirmation first, then retry with force=true.\n\
              - shell_exec: ask before destructive commands (rm, rmdir, dd, mkfs, etc.). Use background=true for EVERYTHING except trivial read-only commands that finish in <5 seconds (ls, cat, grep, ps, df, date, etc.). When in doubt, background=true. NEVER re-run a command that already appears in a [Tools called this turn] block from a previous turn — it is already running or completed.\n\
              - memory_store: create a new memory. Use whenever the user asks you to remember something, or when you learn an important fact. Set pinned=true for explicit user requests.\n\
@@ -316,6 +421,36 @@ tool set. Sub-agents always inherit the user's principal context automatically.\
 }
 
 // ---------------------------------------------------------------------------
+// AgentResponse — returned by handle_message
+// ---------------------------------------------------------------------------
+
+pub struct AgentResponse {
+    /// Raw LLM text — may be empty if the agent only called tools.
+    pub reply_text: String,
+    pub tool_log: Vec<ToolLogEntry>,
+}
+
+impl AgentResponse {
+    /// What to show the user: reply_text if non-empty, else derived from tool actions.
+    pub fn display_text(&self) -> String {
+        if !self.reply_text.is_empty() {
+            return self.reply_text.clone();
+        }
+        if let Some(e) = self.tool_log.iter().find(|e| e.name == "signal_send") {
+            return e.summary.clone();
+        }
+        if !self.tool_log.is_empty() {
+            format!(
+                "[{}]",
+                self.tool_log.iter().map(|e| e.name.as_str()).collect::<Vec<_>>().join(", ")
+            )
+        } else {
+            String::new()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Memory extraction
 // ---------------------------------------------------------------------------
 
@@ -425,10 +560,9 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-/// Build a compact one-line entry for the persistent tool log.
-/// Format: `tool_name(key_arg) → result_summary`
-fn tool_log_entry(name: &str, input: &serde_json::Value, result: &str) -> String {
-    let key_arg = match name {
+/// Build a `ToolLogEntry` for one tool call.
+fn make_tool_log_entry(name: &str, input: &serde_json::Value, result: &str) -> ToolLogEntry {
+    let summary = match name {
         "shell_exec" => {
             let cmd = input["command"].as_str().unwrap_or("").chars().take(60).collect::<String>();
             if input["background"].as_bool().unwrap_or(false) {
@@ -449,10 +583,11 @@ fn tool_log_entry(name: &str, input: &serde_json::Value, result: &str) -> String
         }
         "create_skill" | "list_skills" => input["name"].as_str().unwrap_or("").to_string(),
         "list_tasks" => String::new(),
+        "signal_send" => input["message"].as_str().unwrap_or("").chars().take(60).collect(),
         _ => input.to_string().chars().take(60).collect(),
     };
 
-    let result_summary = result
+    let result_line = result
         .lines()
         .find(|l| !l.trim().is_empty())
         .unwrap_or("(no output)")
@@ -460,10 +595,30 @@ fn tool_log_entry(name: &str, input: &serde_json::Value, result: &str) -> String
         .take(80)
         .collect::<String>();
 
-    if key_arg.is_empty() {
-        format!("{name}() → {result_summary}")
+    ToolLogEntry { name: name.to_string(), summary, result: result_line }
+}
+
+/// Reconstruct the full assistant context block from clean reply text + structured tool log.
+/// This is what goes into the in-memory ConversationContext so the LLM remembers tool calls.
+fn rebuild_stored_for_context(content: &str, tool_log: &[ToolLogEntry]) -> String {
+    if tool_log.is_empty() {
+        return content.to_string();
+    }
+    let log_lines = tool_log
+        .iter()
+        .map(|e| {
+            if e.summary.is_empty() {
+                format!("• {}() → {}", e.name, e.result)
+            } else {
+                format!("• {}({}) → {}", e.name, e.summary, e.result)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if content.is_empty() {
+        format!("[Tools called this turn — do not repeat these in future turns:\n{log_lines}]")
     } else {
-        format!("{name}({key_arg}) → {result_summary}")
+        format!("{content}\n\n[Tools called this turn — do not repeat these in future turns:\n{log_lines}]")
     }
 }
 
@@ -497,6 +652,7 @@ mod tests {
             },
             heartbeat: HeartbeatConfig { interval_secs: 3600 },
             poll_interval_secs: 0,
+            signal: None,
         }
     }
 
