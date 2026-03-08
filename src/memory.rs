@@ -10,6 +10,11 @@ use uuid::Uuid;
 use crate::config::MemoryConfig;
 use crate::embeddings::{cosine_similarity, EmbeddingClient};
 
+/// Minimum cosine similarity for a memory to be included in search results.
+/// Memories below this threshold are not injected into the system prompt,
+/// keeping context clean during unrelated conversations.
+const MIN_SIMILARITY: f64 = 0.4;
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -209,6 +214,9 @@ impl MemoryManager {
                 scored.sort_by(|a, b| b.importance.partial_cmp(&a.importance).unwrap());
             } else {
                 scored.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap());
+                // Drop results below the relevance floor — don't inject noise
+                // into the context for unrelated conversations.
+                scored.retain(|m| m.pinned || m.similarity >= MIN_SIMILARITY);
             }
             scored.truncate(k);
             Ok(scored)

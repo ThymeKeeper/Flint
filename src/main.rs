@@ -269,9 +269,19 @@ async fn main() -> Result<()> {
                                     warn!("Ignoring Signal message from: {}", msg.sender);
                                     continue;
                                 }
+                                // Mark as read + show typing indicator
+                                if msg.timestamp > 0 {
+                                    let _ = sr.send_read_receipt(&msg.sender, msg.timestamp).await;
+                                }
+                                let _ = sr.send_typing(&msg.sender).await;
+
                                 let resp = handle_turn_ret(
                                     &agent, sr, &msg.sender, &msg.sender, &msg.text, "signal", None,
                                 ).await;
+
+                                // Clear typing (stop_typing is best-effort; send() also clears it)
+                                let _ = sr.stop_typing(&msg.sender).await;
+
                                 if let Some(r) = resp {
                                     let text = r.display_text();
                                     if !text.trim().is_empty() {
@@ -555,17 +565,14 @@ fn model_family(model: &str) -> Option<&str> {
 }
 
 /// Resolve a model config value to the latest concrete model ID.
-/// If the config already contains "-latest", use it as-is (the API resolves it).
-/// Otherwise, query the models API to find the latest in that family.
+/// The config value can be a family prefix (e.g. "claude-sonnet", "claude-haiku")
+/// or a concrete ID (e.g. "claude-sonnet-4-6-20250514"). Family prefixes are
+/// resolved via the /v1/models API at startup to find the latest release.
 /// Falls back to the original config value on any failure.
 async fn resolve_model(api_key: &str, configured: &str) -> String {
-    if configured.ends_with("-latest") {
-        return configured.to_string();
-    }
-    let family = match model_family(configured) {
-        Some(f) => f,
-        None => return configured.to_string(),
-    };
+    // Use the configured value as the family prefix to search for.
+    // model_family extracts the prefix if it's a full ID; otherwise use as-is.
+    let family = model_family(configured).unwrap_or(configured);
     match ClaudeClient::resolve_latest_model(api_key, family).await {
         Some(resolved) => {
             if resolved != configured {

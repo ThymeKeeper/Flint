@@ -37,6 +37,12 @@ pub trait SignalClient: Send + Sync {
     /// For the TUI this adds a System message + agent placeholder to the chat.
     /// Default: no-op (non-TUI transports handle notification differently).
     fn push_notification(&self, _text: String) {}
+    /// Show "typing…" indicator to a recipient. Default: no-op.
+    async fn send_typing(&self, _recipient: &str) -> Result<()> { Ok(()) }
+    /// Clear "typing…" indicator. Default: no-op.
+    async fn stop_typing(&self, _recipient: &str) -> Result<()> { Ok(()) }
+    /// Mark a message as read by its timestamp. Default: no-op.
+    async fn send_read_receipt(&self, _recipient: &str, _timestamp: u64) -> Result<()> { Ok(()) }
 }
 
 // ---------------------------------------------------------------------------
@@ -213,7 +219,8 @@ impl SignalTcpRpcClient {
         let (tx, rx) = tokio::sync::mpsc::channel::<IncomingMessage>(64);
         // Background task: maintain a persistent connection and forward
         // incoming message notifications to the channel.
-        tokio::spawn(run_notification_listener(addr.clone(), tx));
+        let own_number = config.phone_number.clone();
+        tokio::spawn(run_notification_listener(addr.clone(), own_number, tx));
         Self {
             addr,
             allowed_senders: config.allowed_senders.clone(),
@@ -322,17 +329,62 @@ impl SignalClient for SignalTcpRpcClient {
     fn is_allowed(&self, sender: &str) -> bool {
         self.allowed_senders.iter().any(|s| s == sender)
     }
+
+    async fn send_typing(&self, recipient: &str) -> Result<()> {
+        self.call(
+            "sendTypingMessage",
+            serde_json::json!({
+                "recipient": [recipient],
+            }),
+        )
+        .await
+        .context("sendTypingMessage failed")?;
+        Ok(())
+    }
+
+    async fn stop_typing(&self, recipient: &str) -> Result<()> {
+        self.call(
+            "sendTypingMessage",
+            serde_json::json!({
+                "recipient": [recipient],
+                "stop": true,
+            }),
+        )
+        .await
+        .context("sendTypingMessage (stop) failed")?;
+        Ok(())
+    }
+
+    async fn send_read_receipt(&self, recipient: &str, timestamp: u64) -> Result<()> {
+        self.call(
+            "sendReceipt",
+            serde_json::json!({
+                "recipient": recipient,
+                "type": "read",
+                "targetTimestamp": [timestamp],
+            }),
+        )
+        .await
+        .context("sendReceipt failed")?;
+        Ok(())
+    }
 }
 
 /// Background task: connect to signal-cli and forward incoming message
 /// notifications to the channel. Reconnects automatically on disconnect.
 async fn run_notification_listener(
     addr: String,
+    own_number: String,
     tx: tokio::sync::mpsc::Sender<IncomingMessage>,
 ) {
+    // Track recently seen timestamps to deduplicate notifications.
+    // signal-cli can emit the same message more than once (e.g. receipt + delivery).
+    let mut recent_timestamps: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
+    const DEDUP_WINDOW: usize = 64;
+
     loop {
         debug!("signal-cli notification listener connecting to {addr}");
-        match listen_for_notifications(&addr, &tx).await {
+        match listen_for_notifications(&addr, &own_number, &tx, &mut recent_timestamps, DEDUP_WINDOW).await {
             Ok(()) => {
                 debug!("signal-cli notification listener: channel closed, exiting");
                 break;
@@ -349,7 +401,10 @@ async fn run_notification_listener(
 /// or the sender is gone. Returns Ok(()) when the channel receiver is dropped.
 async fn listen_for_notifications(
     addr: &str,
+    own_number: &str,
     tx: &tokio::sync::mpsc::Sender<IncomingMessage>,
+    recent_timestamps: &mut std::collections::VecDeque<u64>,
+    dedup_window: usize,
 ) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::net::TcpStream;
@@ -387,6 +442,23 @@ async fn listen_for_notifications(
         info!("signal-cli notification: {}", line.trim());
 
         if let Some(msg) = extract_message_from_notification(&value) {
+            // Skip messages from the bot's own number (sync/sent transcripts).
+            if msg.sender == own_number {
+                debug!("Ignoring self-message from {}", own_number);
+                continue;
+            }
+            // Deduplicate by timestamp — signal-cli can emit the same message
+            // more than once (e.g. receipt echo, re-delivery).
+            if msg.timestamp > 0 && recent_timestamps.contains(&msg.timestamp) {
+                debug!("Ignoring duplicate message (ts={})", msg.timestamp);
+                continue;
+            }
+            if msg.timestamp > 0 {
+                recent_timestamps.push_back(msg.timestamp);
+                if recent_timestamps.len() > dedup_window {
+                    recent_timestamps.pop_front();
+                }
+            }
             if tx.send(msg).await.is_err() {
                 return Ok(()); // receiver dropped
             }

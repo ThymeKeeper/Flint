@@ -59,7 +59,7 @@ pub struct SignalConfig {
 }
 
 fn default_utility_model() -> String {
-    "claude-haiku-4-5-latest".to_string()
+    "claude-haiku".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]

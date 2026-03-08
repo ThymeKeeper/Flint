@@ -92,7 +92,7 @@ impl Agent {
             memories.iter().map(|m| (m.id.clone(), m.similarity)).collect();
 
         // 2. Build system prompt
-        let system_prompt = self.build_system_prompt(&memories).await;
+        let system_prompt = self.build_system_prompt(&memories, channel).await;
 
         // 3. Push user message to context and persist to DB.
         //    Annotate Signal turns so the agent can identify them in the live context,
@@ -227,7 +227,7 @@ impl Agent {
     }
 
     /// Build the system prompt from soul + retrieved memories + date + tool guidelines.
-    async fn build_system_prompt(&self, memories: &[MemoryRef]) -> String {
+    async fn build_system_prompt(&self, memories: &[MemoryRef], channel: &str) -> String {
         let soul = self.soul.read().await;
         let base_prompt = soul.to_system_prompt();
         let memory_section = MemoryManager::format_memories_for_prompt(memories);
@@ -289,7 +289,10 @@ impl Agent {
              `memory_search` to query them.\n\
              - **Background tasks**: Scheduled tasks run independently and report via Signal.\n";
 
-        let tool_list = if self.config.signal.is_some() {
+        // signal_send is only available from TUI — Signal replies are delivered
+        // automatically by the daemon, so the model must never call signal_send
+        // when responding to a Signal message.
+        let tool_list = if self.config.signal.is_some() && channel != "signal" {
             "shell_exec, file_read, file_write, web_fetch, memory_store, memory_search, \
              memory_update, memory_delete, spawn_subagent, schedule_task, schedule_script_task, \
              list_tasks, delete_task, create_skill, list_skills, update_skill, delete_skill, signal_send."
@@ -440,20 +443,43 @@ pub struct AgentResponse {
 impl AgentResponse {
     /// What to show the user: reply_text if non-empty, else derived from tool actions.
     pub fn display_text(&self) -> String {
-        if !self.reply_text.is_empty() {
-            return self.reply_text.clone();
-        }
-        if let Some(e) = self.tool_log.iter().find(|e| e.name == "signal_send") {
-            return e.summary.clone();
-        }
-        if !self.tool_log.is_empty() {
+        let has_signal_send = self.tool_log.iter().any(|e| e.name == "signal_send");
+
+        // If signal_send was called, the real content was already delivered.
+        // The reply_text is typically filler ("Sent.", "Done.", etc.) — use
+        // the signal_send summary instead.
+        let text = if has_signal_send {
+            if let Some(e) = self.tool_log.iter().find(|e| e.name == "signal_send") {
+                e.summary.clone()
+            } else {
+                self.reply_text.clone()
+            }
+        } else if !self.reply_text.is_empty() {
+            self.reply_text.clone()
+        } else if !self.tool_log.is_empty() {
             format!(
                 "[{}]",
                 self.tool_log.iter().map(|e| e.name.as_str()).collect::<Vec<_>>().join(", ")
             )
         } else {
             String::new()
-        }
+        };
+        // Strip any [Tools called this turn...] block the model may have
+        // parroted from conversation history — it's internal bookkeeping,
+        // not user-facing content.
+        strip_tool_log_block(&text)
+    }
+}
+
+/// Remove a trailing `[Tools called this turn ...]` block from model output.
+/// The model sometimes mimics this pattern from conversation history.
+fn strip_tool_log_block(text: &str) -> String {
+    if let Some(start) = text.find("\n[Tools called this turn") {
+        text[..start].trim_end().to_string()
+    } else if text.starts_with("[Tools called this turn") {
+        String::new()
+    } else {
+        text.to_string()
     }
 }
 
@@ -470,13 +496,28 @@ async fn extract_and_store_memories(
 
     let response = llm
         .complete(ClaudeRequest {
-            system: "You extract memorable facts from conversations. Return only valid JSON.",
+            system: "You decide whether a conversation contains facts worth remembering \
+                     long-term. You are VERY selective — most conversations produce nothing. \
+                     Return only valid JSON.",
             messages: vec![ApiMessage {
                 role: "user".to_string(),
                 content: MessageContent::Text(format!(
-                    "Extract notable facts or preferences worth remembering. \
-                     Return a JSON array of objects with \"content\" (string) and \
-                     \"importance\" (float 0-1). Return [] if nothing is notable.\n\n{exchange}"
+                    "Review this exchange and extract ONLY facts that would be valuable to \
+                     recall weeks or months from now. Return a JSON array of objects with \
+                     \"content\" (string) and \"importance\" (float 0-1).\n\n\
+                     ## Importance scale\n\
+                     0.9-1.0: Life events, critical preferences, allergies, key relationships\n\
+                     0.7-0.8: Stated preferences, ongoing projects, goals, technical setup\n\
+                     0.5-0.6: Opinions, interests, recurring topics worth noting\n\
+                     Below 0.5: Not worth storing — return [] instead\n\n\
+                     ## DO NOT extract\n\
+                     - Greetings, small talk, pleasantries\n\
+                     - Things the assistant said or did (tool calls, responses)\n\
+                     - Anything the user would not expect to be remembered\n\
+                     - Transient context (\"I'm tired\", \"just got home\")\n\
+                     - Facts already obvious from the conversation flow\n\n\
+                     Return [] if nothing crosses the 0.5 threshold. Most exchanges produce [].\n\n\
+                     {exchange}"
                 )),
             }],
             max_tokens: 1000,
@@ -498,16 +539,18 @@ async fn extract_and_store_memories(
         }
     };
 
+    let mut stored = 0;
     for e in &extracts {
         let importance = e.importance.clamp(0.0, 1.0);
-        if importance >= 0.2 {
+        if importance >= 0.5 {
             memory
                 .store(&e.content, MemoryKind::Episodic, "signal", importance)
                 .await?;
+            stored += 1;
         }
     }
 
-    debug!("Stored {} extracted memories", extracts.len());
+    debug!("Memory extraction: {} candidates, {} stored (threshold 0.5)", extracts.len(), stored);
     Ok(())
 }
 

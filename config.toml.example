@@ -5,7 +5,7 @@ poll_interval_secs = 3
 
 [claude]
 # api_key loaded from ANTHROPIC_API_KEY env var
-model = "claude-sonnet-4-6"
+model = "claude-sonnet"
 max_tokens = 4096
 context_limit = 200000
 compaction_threshold = 0.75
