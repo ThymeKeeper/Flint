@@ -675,8 +675,8 @@ mod tests {
         }
     }
 
-    // Unit tests for build_system_prompt and context logic don't need a live
-    // Qdrant. Full agent integration tests live in tests/agent_test.rs.
+    // Unit tests for build_system_prompt and context logic use in-memory DuckDB.
+    // Full agent integration tests live in tests/agent_test.rs.
 
     #[test]
     fn test_config_db_path() {

@@ -23,7 +23,7 @@ fn main() {
     let model_dir = manifest_dir.join("models");
     std::fs::create_dir_all(&model_dir).expect("Failed to create models/ directory");
 
-    // Qdrant's quantized export of BAAI/bge-small-en-v1.5 (~22 MB).
+    // Quantized BGE-small-en-v1.5 ONNX model from HuggingFace (~22 MB).
     let base = "https://huggingface.co/Qdrant/bge-small-en-v1.5-onnx-Q/resolve/main";
 
     let downloads: &[(&str, &str)] = &[
