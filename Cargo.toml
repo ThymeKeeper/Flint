@@ -1,16 +1,16 @@
 [package]
-name = "clawd"
+name = "flint"
 version = "0.1.0"
 edition = "2021"
-description = "Personal AI agent daemon powered by Claude"
+description = "Personal AI agent daemon"
 license = "MIT"
 
 [lib]
-name = "clawd"
+name = "flint"
 path = "src/lib.rs"
 
 [[bin]]
-name = "clawd"
+name = "flint"
 path = "src/main.rs"
 
 [dependencies]

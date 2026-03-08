@@ -1,6 +1,6 @@
 //! First-run interactive setup wizard — cozy RPG edition.
 //!
-//! Creates `~/.clawd/config.toml` and `~/.clawd/soul.yaml` (or a user-chosen
+//! Creates `~/.flint/config.toml` and `~/.flint/soul.yaml` (or a user-chosen
 //! directory) by prompting for the minimum required information.
 //!
 //! **Caret / backspace fix**: decorative text is always printed via `println!`
@@ -211,12 +211,12 @@ fn prompt_confirm(title: &str, body: &str, default: bool) -> Result<bool> {
 
 // ── Default paths ─────────────────────────────────────────────────────────────
 
-/// Default data directory: `~/.clawd/`
+/// Default data directory: `~/.flint/`
 pub fn default_data_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".clawd"))
+    dirs::home_dir().map(|h| h.join(".flint"))
 }
 
-/// Default config path: `~/.clawd/config.toml`
+/// Default config path: `~/.flint/config.toml`
 pub fn default_config_path() -> Option<PathBuf> {
     default_data_dir().map(|d| d.join("config.toml"))
 }
@@ -230,10 +230,9 @@ pub fn print_splash() {
     println!();
     rule();
     println!();
-    println!("        /\\_/\\");
-    println!("       ( · · )   {}", bold("c l a w d"));
-    println!("        \\ v /");
-    println!("         `~'");
+    println!("       {}", bold("f l i n t"));
+    println!();
+    println!("       {}", dim("·  ·  ·"));
     println!();
     rule();
     println!();
@@ -280,7 +279,7 @@ pub fn run_setup_wizard() -> Result<PathBuf> {
     // ── Data directory ───────────────────────────────────────────────────────
     let default_dir = default_data_dir()
         .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| "./clawd-data".to_string());
+        .unwrap_or_else(|| "./flint-data".to_string());
 
     let data_dir_str = prompt_input(
         "where do I live?",
@@ -296,7 +295,7 @@ pub fn run_setup_wizard() -> Result<PathBuf> {
     let agent_name = prompt_input(
         "what am I called?",
         "I don't have a name yet. What would you like to call me?",
-        "Clawd",
+        "Flint",
     )?;
 
     // ── Persona ──────────────────────────────────────────────────────────────
@@ -430,7 +429,7 @@ pub fn run_setup_wizard() -> Result<PathBuf> {
                         println!("  {} Linking failed: {e:#}", amber("~"));
                         println!(
                             "  {}",
-                            dim("Run  clawd --setup  again to retry, or add [signal] manually.")
+                            dim("Run  flint --setup  again to retry, or add [signal] manually.")
                         );
                         println!();
                         None
@@ -495,7 +494,7 @@ pub fn run_setup_wizard() -> Result<PathBuf> {
         16,
     );
     println!();
-    println!("       {}", dim(&format!("Run {}  to start talking.", bold("clawd"))));
+    println!("       {}", dim(&format!("Run {}  to start talking.", bold("flint"))));
     println!();
     println!("       {}  {}", dim("config"), dim(&config_path.display().to_string()));
     println!("       {}    {}", dim("soul"), dim(&soul_path.display().to_string()));

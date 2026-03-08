@@ -1,4 +1,4 @@
-soul_path = "/etc/clawd/soul.yaml"
+soul_path = "/etc/flint/soul.yaml"
 
 [claude]
 # api_key loaded from ANTHROPIC_API_KEY env var

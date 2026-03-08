@@ -253,7 +253,7 @@ impl Agent {
             let config_toml = std::path::Path::new(&self.config.soul_path)
                 .parent()
                 .map(|p| p.join("config.toml").to_string_lossy().into_owned())
-                .unwrap_or_else(|| "~/.clawd/config.toml".to_string());
+                .unwrap_or_else(|| "~/.flint/config.toml".to_string());
             format!(
                 "\n## Channels\n\
                  You currently only have the TUI channel. Signal is not configured.\n\
@@ -261,7 +261,7 @@ impl Agent {
                  the automated part (download + link + QR code). Once the skill returns the \
                  QR/URI, display it, then guide the user through the rest:\n\
                  - Wait for them to scan and confirm the device appears in Signal\n\
-                 - Run: `~/.clawd/bin/signal-cli --config ~/.clawd/signal-data listAccounts`\n\
+                 - Run: `~/.flint/bin/signal-cli --config ~/.flint/signal-data listAccounts`\n\
                  - If that returns a phone number, ask for their own number (allowed sender)\n\
                  - If listAccounts returns empty or fails, show the raw output and ask the \
                    user to type their phone number manually — do NOT proceed without it\n\
@@ -272,12 +272,12 @@ impl Agent {
                    [signal]\n\
                    phone_number = \"<the number>\"\n\
                    allowed_senders = [\"<their number>\"]\n\
-                 - Tell them to restart clawd\n"
+                 - Tell them to restart flint\n"
             )
         };
 
         let arch_section = "\n## Architecture\n\
-             You are clawd, a persistent AI daemon. Key facts about your own operation:\n\
+             You are a persistent AI daemon. Key facts about your own operation:\n\
              - **Conversation history**: Every turn is persisted to DuckDB. On startup the last \
              200 turns are loaded into your context, so you have full continuity across restarts. \
              Do NOT say \"I only know within this session\" — you have durable memory.\n\

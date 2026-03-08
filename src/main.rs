@@ -4,20 +4,20 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
-use clawd::agent::Agent;
-use clawd::claude::ClaudeClient;
-use clawd::config::{AppConfig, Soul};
-use clawd::conversation_store::{ConversationStore, StoredTurn};
-use clawd::embeddings::{LocalEmbeddingClient, EMBEDDING_DIM};
-use clawd::heartbeat;
-use clawd::jobs::BackgroundJobStore;
-use clawd::memory::MemoryManager;
-use clawd::observer::AgentObserver;
-use clawd::setup;
-use clawd::signal::{SignalClient, SignalTcpRpcClient, TuiSignalClient};
-use clawd::signal_daemon;
-use clawd::skills::SkillManager;
-use clawd::tasks::TaskManager;
+use flint::agent::Agent;
+use flint::claude::ClaudeClient;
+use flint::config::{AppConfig, Soul};
+use flint::conversation_store::{ConversationStore, StoredTurn};
+use flint::embeddings::{LocalEmbeddingClient, EMBEDDING_DIM};
+use flint::heartbeat;
+use flint::jobs::BackgroundJobStore;
+use flint::memory::MemoryManager;
+use flint::observer::AgentObserver;
+use flint::setup;
+use flint::signal::{SignalClient, SignalTcpRpcClient, TuiSignalClient};
+use flint::signal_daemon;
+use flint::skills::SkillManager;
+use flint::tasks::TaskManager;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -29,7 +29,7 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    info!("clawd starting up");
+    info!("flint starting up");
 
     // ── SIGINT handler — Ctrl+C no longer exits; use Ctrl+Q ──────────────────
     {
@@ -53,7 +53,7 @@ async fn main() -> Result<()> {
     // ── API keys ─────────────────────────────────────────────────────────────
     let anthropic_key = config
         .resolve_anthropic_key()
-        .context("No Anthropic API key found. Set ANTHROPIC_API_KEY or run clawd --setup.")?;
+        .context("No Anthropic API key found. Set ANTHROPIC_API_KEY or run flint --setup.")?;
 
     // ── Soul ──────────────────────────────────────────────────────────────────
     let soul_path = PathBuf::from(&config.soul_path);
@@ -62,7 +62,7 @@ async fn main() -> Result<()> {
     info!("Soul loaded: {}", soul.name);
     let agent_name = soul.name.clone();
     let soul = Arc::new(RwLock::new(soul));
-    let _soul_watcher = clawd::config::spawn_soul_watcher(soul_path, soul.clone())
+    let _soul_watcher = flint::config::spawn_soul_watcher(soul_path, soul.clone())
         .context("Failed to start soul watcher")?;
 
     // ── Resolve latest models ──────────────────────────────────────────────
@@ -71,20 +71,20 @@ async fn main() -> Result<()> {
     info!("Models: main={main_model}, utility={utility_model}");
 
     // ── LLM clients ──────────────────────────────────────────────────────────
-    let llm: Arc<dyn clawd::claude::LlmClient> = Arc::new(ClaudeClient::with_model(
+    let llm: Arc<dyn flint::claude::LlmClient> = Arc::new(ClaudeClient::with_model(
         anthropic_key.clone(),
         config.claude.clone(),
         main_model,
     ));
     // Cheap model for background memory work (extraction, consolidation, compaction)
-    let utility_llm: Arc<dyn clawd::claude::LlmClient> = Arc::new(ClaudeClient::with_model(
+    let utility_llm: Arc<dyn flint::claude::LlmClient> = Arc::new(ClaudeClient::with_model(
         anthropic_key,
         config.claude.clone(),
         utility_model,
     ));
 
     // ── Embedding client (bundled BGE-small-en-v1.5-Q, no API key needed) ──────
-    let embedder: Arc<dyn clawd::embeddings::EmbeddingClient> =
+    let embedder: Arc<dyn flint::embeddings::EmbeddingClient> =
         Arc::new(LocalEmbeddingClient::new().context("Failed to initialize local embeddings")?);
 
     // ── Memory (DuckDB) ───────────────────────────────────────────────────────
@@ -128,7 +128,7 @@ async fn main() -> Result<()> {
     let (job_store, mut job_notify_rx) = BackgroundJobStore::new();
 
     // ── TUI signal client ─────────────────────────────────────────────────────
-    let (tui_channels, user_input_tx, agent_update_rx) = clawd::tui::create_channels();
+    let (tui_channels, user_input_tx, agent_update_rx) = flint::tui::create_channels();
     let tui_client = Arc::new(TuiSignalClient::new(tui_channels));
 
     // Push persisted history to TUI before it starts rendering.
@@ -155,13 +155,13 @@ async fn main() -> Result<()> {
     {
         let agent_name = agent_name.clone();
         tokio::task::spawn_blocking(move || {
-            clawd::tui::run_tui(agent_name, user_input_tx, agent_update_rx);
+            flint::tui::run_tui(agent_name, user_input_tx, agent_update_rx);
         });
     }
 
     let tui_dyn: Arc<dyn SignalClient> = tui_client.clone();
 
-    // ── Signal CLI daemon (started if clawd manages the binary) ──────────────
+    // ── Signal CLI daemon (started if flint manages the binary) ──────────────
     // If setup downloaded signal-cli into the data directory, we start it as an
     // HTTP daemon here and keep `_signal_daemon` alive for the process lifetime.
     let data_dir = config_path
@@ -320,7 +320,7 @@ async fn handle_turn_ret(
     text: &str,
     channel: &str,
     observer: Option<Arc<dyn AgentObserver>>,
-) -> Option<clawd::agent::AgentResponse> {
+) -> Option<flint::agent::AgentResponse> {
     match agent.handle_message(sender, text, observer, channel).await {
         Ok(response) => {
             let display = response.display_text();
@@ -356,7 +356,7 @@ async fn drain_jobs(
     tui: &Arc<dyn SignalClient>,
     signal_rest: Option<&Arc<dyn SignalClient>>,
     primary_contact: &str,
-    job_notify_rx: &mut tokio::sync::mpsc::Receiver<clawd::jobs::JobNotification>,
+    job_notify_rx: &mut tokio::sync::mpsc::Receiver<flint::jobs::JobNotification>,
     tui_client: &Arc<TuiSignalClient>,
 ) {
     while let Ok(notification) = job_notify_rx.try_recv() {
@@ -395,7 +395,7 @@ fn display_text_for_turn(t: &StoredTurn) -> String {
 /// Await Signal REST messages, or park forever if Signal REST is not configured.
 async fn receive_or_pending(
     client: &Option<Arc<dyn SignalClient>>,
-) -> Result<Vec<clawd::signal::IncomingMessage>, anyhow::Error> {
+) -> Result<Vec<flint::signal::IncomingMessage>, anyhow::Error> {
     match client {
         Some(c) => c.receive().await,
         None => std::future::pending().await,
@@ -409,8 +409,8 @@ async fn receive_or_pending(
 /// Seed the `signal-setup` skill when Signal is not configured so the agent
 /// can guide the user through setup interactively. Remove it once configured.
 async fn sync_signal_setup_skill(
-    skills: &clawd::skills::SkillManager,
-    config: &clawd::config::AppConfig,
+    skills: &flint::skills::SkillManager,
+    config: &flint::config::AppConfig,
     config_path: &std::path::Path,
 ) {
     const SKILL_NAME: &str = "signal-setup";
@@ -427,7 +427,7 @@ async fn sync_signal_setup_skill(
     let data_dir = config_path
         .parent()
         .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "~/.clawd".to_string());
+        .unwrap_or_else(|| "~/.flint".to_string());
     let bin = format!("{data_dir}/bin/signal-cli");
     let sig_data = format!("{data_dir}/signal-data");
     let config_toml = config_path.to_string_lossy().into_owned();
@@ -448,7 +448,7 @@ async fn sync_signal_setup_skill(
             chmod +x {bin}\n\
             ```\n\
          2. Start the link flow (background=true, redirect stderr to stdout):\n\
-            `{bin} --config {sig_data} link -n clawd 2>&1`\n\
+            `{bin} --config {sig_data} link -n flint 2>&1`\n\
          3. Wait ~3 seconds, then read the job log file.\n\
          4. Return ONLY:\n\
             - The exact `sgnl://` URI on its own line\n\
@@ -499,10 +499,10 @@ fn resolve_config_path() -> Result<PathBuf> {
             "--setup" => force_setup = true,
             "--help" | "-h" => {
                 println!(
-                    "Usage: clawd [--config <path>] [--setup]\n\
+                    "Usage: flint [--config <path>] [--setup]\n\
                      \n\
                      Options:\n\
-                     --config <path>  Path to config.toml (default: ~/.clawd/config.toml)\n\
+                     --config <path>  Path to config.toml (default: ~/.flint/config.toml)\n\
                      --setup          Re-run the first-time setup wizard\n\
                      --help           Show this help"
                 );

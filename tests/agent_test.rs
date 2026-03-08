@@ -5,15 +5,15 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use clawd::agent::Agent;
-use clawd::claude::mock::MockLlm;
-use clawd::config::*;
-use clawd::conversation_store::ConversationStore;
-use clawd::embeddings::mock::MockEmbeddingClient;
-use clawd::jobs::BackgroundJobStore;
-use clawd::memory::MemoryManager;
-use clawd::skills::SkillManager;
-use clawd::tasks::TaskManager;
+use flint::agent::Agent;
+use flint::claude::mock::MockLlm;
+use flint::config::*;
+use flint::conversation_store::ConversationStore;
+use flint::embeddings::mock::MockEmbeddingClient;
+use flint::jobs::BackgroundJobStore;
+use flint::memory::MemoryManager;
+use flint::skills::SkillManager;
+use flint::tasks::TaskManager;
 
 fn test_config() -> AppConfig {
     AppConfig {

@@ -577,41 +577,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "clawd"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arboard",
- "async-trait",
- "bytes",
- "chrono",
- "crossterm",
- "dialoguer",
- "dirs 5.0.1",
- "duckdb",
- "fastembed",
- "flate2",
- "futures",
- "notify",
- "ratatui",
- "regex",
- "reqwest",
- "serde",
- "serde_json",
- "serde_yaml",
- "tar",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
- "tui-textarea",
- "ureq 2.12.1",
- "uuid",
-]
-
-[[package]]
 name = "clipboard-win"
 version = "5.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1234,6 +1199,41 @@ dependencies = [
  "crc32fast",
  "miniz_oxide",
  "zlib-rs",
+]
+
+[[package]]
+name = "flint"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arboard",
+ "async-trait",
+ "bytes",
+ "chrono",
+ "crossterm",
+ "dialoguer",
+ "dirs 5.0.1",
+ "duckdb",
+ "fastembed",
+ "flate2",
+ "futures",
+ "notify",
+ "ratatui",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tar",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "tui-textarea",
+ "ureq 2.12.1",
+ "uuid",
 ]
 
 [[package]]

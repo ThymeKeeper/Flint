@@ -1,7 +1,7 @@
 //! Manages the signal-cli subprocess: download, initial device link, and HTTP daemon.
 //!
 //! signal-cli is a Java-free native binary that exposes the Signal protocol.
-//! clawd downloads it on first use and manages the daemon lifecycle.
+//! flint downloads it on first use and manages the daemon lifecycle.
 //!
 //! Supported platforms: Linux x86_64 only (the only platform with a native binary).
 
@@ -23,7 +23,7 @@ const DOWNLOAD_URL: &str = concat!(
 // Paths
 // ---------------------------------------------------------------------------
 
-/// Path to the signal-cli binary inside the clawd data directory.
+/// Path to the signal-cli binary inside the flint data directory.
 pub fn bin_path(data_dir: &Path) -> PathBuf {
     data_dir.join("bin").join("signal-cli")
 }
@@ -133,7 +133,7 @@ pub fn run_link_flow(data_dir: &Path) -> Result<String> {
             sig_data.to_str().unwrap(),
             "link",
             "-n",
-            "clawd",
+            "flint",
         ])
         .status()
         .context("Failed to run signal-cli link")?;
@@ -282,7 +282,7 @@ pub async fn run_watchdog(
         if restarts > MAX_RESTARTS {
             let msg = format!(
                 "Signal: signal-cli has crashed {restarts} times in a row. \
-                 Restart clawd to reconnect."
+                 Restart flint to reconnect."
             );
             warn!("{msg}");
             notify(msg);

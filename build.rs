@@ -68,5 +68,5 @@ fn main() {
     let abs = model_dir
         .canonicalize()
         .expect("Failed to resolve models/ path");
-    println!("cargo:rustc-env=CLAWD_MODELS_DIR={}", abs.display());
+    println!("cargo:rustc-env=FLINT_MODELS_DIR={}", abs.display());
 }

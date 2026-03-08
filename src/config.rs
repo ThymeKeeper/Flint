@@ -53,7 +53,7 @@ pub struct SignalConfig {
     #[serde(default)]
     pub allowed_senders: Vec<String>,
     /// Base URL of the signal-cli REST API.
-    /// When clawd manages signal-cli, this is set automatically to http://localhost:8080.
+    /// When flint manages signal-cli, this is set automatically to http://localhost:8080.
     #[serde(default = "default_signal_base_url")]
     pub base_url: String,
 }

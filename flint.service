@@ -1,20 +1,20 @@
 [Unit]
-Description=Clawd personal AI agent daemon
+Description=Flint personal AI agent daemon
 After=network.target signal-cli.service
 Requires=signal-cli.service
 
 [Service]
 Type=simple
-User=clawd
-EnvironmentFile=/etc/clawd/clawd.env
-ExecStart=/usr/local/bin/clawd --config /etc/clawd/config.toml
+User=flint
+EnvironmentFile=/etc/flint/flint.env
+ExecStart=/usr/local/bin/flint --config /etc/flint/config.toml
 Restart=on-failure
 RestartSec=10
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=/var/lib/clawd
+ReadWritePaths=/var/lib/flint
 StandardOutput=journal
-SyslogIdentifier=clawd
+SyslogIdentifier=flint
 
 [Install]
 WantedBy=multi-user.target

@@ -4,9 +4,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use clawd::config::MemoryConfig;
-use clawd::embeddings::mock::MockEmbeddingClient;
-use clawd::memory::{MemoryKind, MemoryManager, MemoryRef};
+use flint::config::MemoryConfig;
+use flint::embeddings::mock::MockEmbeddingClient;
+use flint::memory::{MemoryKind, MemoryManager, MemoryRef};
 
 const DIM: usize = 4; // tiny dimension so tests run fast
 

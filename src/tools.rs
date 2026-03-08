@@ -1276,8 +1276,8 @@ mod tests {
 
     #[test]
     fn test_file_write_force_skips_permission_check() {
-        // /tmp/clawd_test_nonexistent should not exist; force=true should attempt write
-        let path = "/tmp/clawd_tools_test_write.txt";
+        // /tmp/flint_test_nonexistent should not exist; force=true should attempt write
+        let path = "/tmp/flint_tools_test_write.txt";
         let _ = std::fs::remove_file(path); // clean up if exists
         let input = serde_json::json!({"path": path, "content": "hello", "force": true});
         let result = file_write(&input);
@@ -1287,7 +1287,7 @@ mod tests {
 
     #[test]
     fn test_file_write_no_overwrite_without_force() {
-        let path = "/tmp/clawd_tools_test_overwrite.txt";
+        let path = "/tmp/flint_tools_test_overwrite.txt";
         std::fs::write(path, "existing").unwrap();
         let input = serde_json::json!({"path": path, "content": "new"});
         let result = file_write(&input);
@@ -1323,7 +1323,7 @@ mod tests {
 
     #[test]
     fn test_file_read_nonexistent() {
-        let input = serde_json::json!({"path": "/tmp/clawd_does_not_exist_xyz.txt"});
+        let input = serde_json::json!({"path": "/tmp/flint_does_not_exist_xyz.txt"});
         let result = file_read(&input);
         assert!(result.starts_with("Error reading file"));
     }

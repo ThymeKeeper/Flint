@@ -30,7 +30,7 @@ pub struct LocalEmbeddingClient {
 impl LocalEmbeddingClient {
     /// Load the model from the directory baked in at compile time by build.rs.
     pub fn new() -> Result<Self> {
-        let dir = std::path::PathBuf::from(env!("CLAWD_MODELS_DIR"));
+        let dir = std::path::PathBuf::from(env!("FLINT_MODELS_DIR"));
         Self::from_dir(&dir)
     }
 
