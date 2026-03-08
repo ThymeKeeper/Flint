@@ -26,6 +26,7 @@ fn test_config() -> AppConfig {
             max_tokens: 100,
             context_limit: 200000,
             compaction_threshold: 0.75,
+            utility_model: "test".to_string(),
         },
         memory: MemoryConfig {
             max_memories: 1000,
@@ -70,8 +71,12 @@ async fn build_agent(llm_responses: Vec<String>) -> Arc<Agent> {
     let skills = Arc::new(SkillManager::in_memory().await.unwrap());
     let (jobs, _) = BackgroundJobStore::new();
     let conv_store = Arc::new(ConversationStore::new(memory.connection()).unwrap());
+    // Utility LLM handles memory extraction/consolidation — needs enough responses.
+    let utility_llm = Arc::new(MockLlm::new(vec![
+        "[]".to_string(), "[]".to_string(), "[]".to_string(), "[]".to_string(),
+    ]));
     Arc::new(Agent::new(
-        soul, llm, memory, tasks, skills, jobs, conv_store, config, vec![], None,
+        soul, llm, utility_llm, memory, tasks, skills, jobs, conv_store, config, vec![], None,
     ))
 }
 
@@ -79,7 +84,6 @@ async fn build_agent(llm_responses: Vec<String>) -> Arc<Agent> {
 async fn test_agent_handle_message() {
     let agent = build_agent(vec![
         "Hello! I'm your assistant.".to_string(),
-        "[]".to_string(), // memory extraction
     ])
     .await;
 
@@ -94,9 +98,7 @@ async fn test_agent_handle_message() {
 async fn test_agent_multiple_messages() {
     let agent = build_agent(vec![
         "First response.".to_string(),
-        "[]".to_string(),
         "Second response.".to_string(),
-        "[]".to_string(),
     ])
     .await;
 
@@ -111,7 +113,7 @@ async fn test_agent_multiple_messages() {
 
 #[tokio::test]
 async fn test_agent_context_tracking() {
-    let agent = build_agent(vec!["Response.".to_string(), "[]".to_string()]).await;
+    let agent = build_agent(vec!["Response.".to_string()]).await;
 
     {
         let ctx = agent.context.read().await;

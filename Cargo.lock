@@ -594,6 +594,7 @@ dependencies = [
  "futures",
  "notify",
  "ratatui",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

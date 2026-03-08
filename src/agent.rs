@@ -21,6 +21,8 @@ use crate::tools::{self, ToolExecutorConfig};
 pub struct Agent {
     pub soul: Arc<RwLock<Soul>>,
     pub llm: Arc<dyn LlmClient>,
+    /// Cheap model for background work (memory extraction, consolidation, compaction).
+    pub utility_llm: Arc<dyn LlmClient>,
     pub memory: Arc<MemoryManager>,
     pub tasks: Arc<TaskManager>,
     pub skills: Arc<SkillManager>,
@@ -39,6 +41,7 @@ impl Agent {
     pub fn new(
         soul: Arc<RwLock<Soul>>,
         llm: Arc<dyn LlmClient>,
+        utility_llm: Arc<dyn LlmClient>,
         memory: Arc<MemoryManager>,
         tasks: Arc<TaskManager>,
         skills: Arc<SkillManager>,
@@ -61,7 +64,7 @@ impl Agent {
             };
             context.push(role, content);
         }
-        Self { soul, llm, memory, tasks, skills, jobs, conv_store, context: RwLock::new(context), config, signal_client }
+        Self { soul, llm, utility_llm, memory, tasks, skills, jobs, conv_store, context: RwLock::new(context), config, signal_client }
     }
 
     /// Handle an incoming message: retrieve memories, generate response, store memories.
@@ -202,8 +205,9 @@ impl Agent {
 
         // 7. Fire-and-forget: post-conversation memory tasks
         //    (mark accessed with boost → extract new memories → consolidate clusters)
+        //    Uses the cheap utility model (Haiku) instead of the main model.
         let memory_mgr = self.memory.clone();
-        let llm = self.llm.clone();
+        let llm = self.utility_llm.clone();
         let exchange_text = format!("User: {text}\nAssistant: {final_text}");
         let id_sims = mem_id_sims.clone();
         tokio::spawn(async move {
@@ -287,12 +291,12 @@ impl Agent {
 
         let tool_list = if self.config.signal.is_some() {
             "shell_exec, file_read, file_write, web_fetch, memory_store, memory_search, \
-             memory_update, memory_delete, spawn_subagent, schedule_task, list_tasks, \
-             delete_task, create_skill, list_skills, update_skill, delete_skill, signal_send."
+             memory_update, memory_delete, spawn_subagent, schedule_task, schedule_script_task, \
+             list_tasks, delete_task, create_skill, list_skills, update_skill, delete_skill, signal_send."
         } else {
             "shell_exec, file_read, file_write, web_fetch, memory_store, memory_search, \
-             memory_update, memory_delete, spawn_subagent, schedule_task, list_tasks, \
-             delete_task, create_skill, list_skills, update_skill, delete_skill."
+             memory_update, memory_delete, spawn_subagent, schedule_task, schedule_script_task, \
+             list_tasks, delete_task, create_skill, list_skills, update_skill, delete_skill."
         };
 
         format!(
@@ -309,11 +313,14 @@ impl Agent {
              - memory_update: correct or replace a memory's content; re-embeds automatically.\n\
              - memory_delete: permanently remove a fully obsolete memory.\n\
              - spawn_subagent: delegate a self-contained task to an isolated sub-agent.\n\
-             - schedule_task: create a background task that runs autonomously on a schedule. \
+             - schedule_task: create a background task that runs autonomously on a schedule (uses LLM). \
 The task runner has shell_exec, web_fetch, file_read, file_write, memory_search, and memory_store. \
 Use trigger_type='interval' (seconds), 'cron' (HH:MM UTC), or 'once' (RFC3339 timestamp). \
 Set max_idle_runs higher (e.g. 100) for long-wait monitoring — the runner uses 'still_waiting' \
 state to stay alive without wasting idle budget.\n\
+             - schedule_script_task: create a mechanical background task (NO LLM cost). \
+Runs a shell command and checks output against a regex pattern. Prefer this over schedule_task \
+when the task is just 'run a command and check the result'. Use {{output}} in message_template.\n\
              - list_tasks: show all scheduled tasks with their status and next run time.\n\
              - delete_task: cancel and remove a scheduled task by ID.\n\
              - create_skill: define a named sub-agent profile with a custom system prompt and \
@@ -353,13 +360,13 @@ tool set. Sub-agents always inherit the user's principal context automatically.\
             .collect::<Vec<_>>()
             .join("\n\n");
 
-        // Extract key facts as Semantic memories
+        // Extract key facts as Semantic memories (uses cheap utility model)
         let facts_prompt = format!(
             "Extract the key facts, preferences, and important information from this \
              conversation segment. Return a JSON array of strings.\n\n{old_text}"
         );
         if let Ok(json_str) = self
-            .llm
+            .utility_llm
             .complete(ClaudeRequest {
                 system: "You extract facts from conversations. Return only a JSON array of strings.",
                 messages: vec![ApiMessage {
@@ -385,9 +392,9 @@ tool set. Sub-agents always inherit the user's principal context automatically.\
             }
         }
 
-        // Generate a summary
+        // Generate a summary (uses cheap utility model)
         let summary = self
-            .llm
+            .utility_llm
             .complete(ClaudeRequest {
                 system: "You summarize conversations concisely.",
                 messages: vec![ApiMessage {
@@ -577,13 +584,13 @@ fn make_tool_log_entry(name: &str, input: &serde_json::Value, result: &str) -> T
         "memory_store" => input["title"].as_str().unwrap_or("").chars().take(50).collect(),
         "memory_update" | "memory_delete" => input["id"].as_str().unwrap_or("").to_string(),
         "spawn_subagent" => input["task"].as_str().unwrap_or("").chars().take(50).collect(),
-        "schedule_task" => input["name"].as_str().unwrap_or("").chars().take(50).collect(),
+        "schedule_task" | "schedule_script_task" => input["description"].as_str().unwrap_or("").chars().take(50).collect(),
         "delete_task" | "delete_skill" | "update_skill" => {
             input["id"].as_str().unwrap_or("").to_string()
         }
         "create_skill" | "list_skills" => input["name"].as_str().unwrap_or("").to_string(),
         "list_tasks" => String::new(),
-        "signal_send" => input["message"].as_str().unwrap_or("").chars().take(60).collect(),
+        "signal_send" => input["message"].as_str().unwrap_or("").to_string(),
         _ => input.to_string().chars().take(60).collect(),
     };
 
@@ -642,6 +649,7 @@ mod tests {
                 max_tokens: 100,
                 context_limit: 200000,
                 compaction_threshold: 0.75,
+                utility_model: "test".to_string(),
             },
             memory: MemoryConfig {
                 max_memories: 1000,
@@ -693,6 +701,7 @@ mod tests {
             max_tokens: 100,
             context_limit: 100,
             compaction_threshold: 0.75,
+            utility_model: "test".to_string(),
         };
         let mut ctx = ConversationContext::new(config);
         assert!(!ctx.compaction_needed());

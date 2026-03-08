@@ -130,6 +130,47 @@ impl ClaudeClient {
         }
     }
 
+    /// Create a client that overrides the model (e.g. for utility/cheap work).
+    pub fn with_model(api_key: String, config: ClaudeConfig, model: String) -> Self {
+        let mut config = config;
+        config.model = model;
+        Self::new(api_key, config)
+    }
+
+    /// Query the Anthropic API for available models and return the latest model ID
+    /// matching the given family prefix (e.g. "claude-haiku", "claude-sonnet").
+    /// Returns None if the API call fails or no models match.
+    pub async fn resolve_latest_model(api_key: &str, family: &str) -> Option<String> {
+        let http = reqwest::Client::new();
+        let resp = http
+            .get("https://api.anthropic.com/v1/models")
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .send()
+            .await
+            .ok()?;
+
+        if !resp.status().is_success() {
+            debug!("Models API returned {}", resp.status());
+            return None;
+        }
+
+        let body: serde_json::Value = resp.json().await.ok()?;
+        let models = body["data"].as_array()?;
+
+        // Find the latest model whose ID starts with the family prefix,
+        // sorted by created_at descending.
+        models
+            .iter()
+            .filter(|m| {
+                m["id"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with(family))
+            })
+            .max_by_key(|m| m["created_at"].as_str().unwrap_or("").to_string())
+            .and_then(|m| m["id"].as_str().map(|s| s.to_string()))
+    }
+
     /// Build the messages list from a ConversationContext for convenience.
     pub fn messages_from_context(ctx: &ConversationContext) -> Vec<ApiMessage> {
         ctx.messages()
@@ -154,8 +195,8 @@ impl ClaudeClient {
         let body = serde_json::json!({
             "model": self.config.model,
             "max_tokens": max_tok,
-            "system": system,
-            "messages": messages,
+            "system": build_cached_system(system),
+            "messages": build_cached_messages(&messages),
             "stream": true,
         });
 
@@ -218,8 +259,8 @@ impl LlmClient for ClaudeClient {
         let mut body = serde_json::json!({
             "model": self.config.model,
             "max_tokens": req.max_tokens,
-            "system": req.system,
-            "messages": req.messages,
+            "system": build_cached_system(req.system),
+            "messages": build_cached_messages(&req.messages),
         });
         if !req.tools.is_empty() {
             body["tools"] = serde_json::to_value(req.tools)
@@ -305,8 +346,8 @@ impl LlmClient for ClaudeClient {
         let mut body = serde_json::json!({
             "model": self.config.model,
             "max_tokens": req.max_tokens,
-            "system": req.system,
-            "messages": req.messages,
+            "system": build_cached_system(req.system),
+            "messages": build_cached_messages(&req.messages),
             "stream": true,
         });
         if !req.tools.is_empty() {
@@ -460,6 +501,59 @@ impl LlmClient for ClaudeClient {
 
         Ok(LlmResponse { text, tool_calls, stop_reason, raw_blocks })
     }
+}
+
+// ---------------------------------------------------------------------------
+// Prompt caching helpers
+// ---------------------------------------------------------------------------
+
+/// Convert the system prompt string into the array-of-blocks format required
+/// for Anthropic prompt caching, with `cache_control` on the block.
+fn build_cached_system(system: &str) -> serde_json::Value {
+    serde_json::json!([{
+        "type": "text",
+        "text": system,
+        "cache_control": { "type": "ephemeral" }
+    }])
+}
+
+/// Clone the messages array but add `cache_control` to the last message's
+/// content so the prefix up to that point is cached on subsequent calls
+/// within the same tool loop.
+fn build_cached_messages(messages: &[ApiMessage]) -> Vec<serde_json::Value> {
+    if messages.is_empty() {
+        return vec![];
+    }
+    let mut out: Vec<serde_json::Value> = messages
+        .iter()
+        .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
+        .collect();
+
+    // Mark the last message for caching. For text messages, wrap in a block
+    // with cache_control. For block messages (tool results), add cache_control
+    // to the last block.
+    if let Some(last) = out.last_mut() {
+        match &messages.last().unwrap().content {
+            MessageContent::Text(t) => {
+                last["content"] = serde_json::json!([{
+                    "type": "text",
+                    "text": t,
+                    "cache_control": { "type": "ephemeral" }
+                }]);
+            }
+            MessageContent::Blocks(blocks) => {
+                // Serialize blocks normally, then add cache_control to the last one.
+                if let Ok(mut arr) = serde_json::to_value(blocks) {
+                    if let Some(last_block) = arr.as_array_mut().and_then(|a| a.last_mut()) {
+                        last_block["cache_control"] = serde_json::json!({ "type": "ephemeral" });
+                    }
+                    last["content"] = arr;
+                }
+            }
+        }
+    }
+
+    out
 }
 
 // ---------------------------------------------------------------------------

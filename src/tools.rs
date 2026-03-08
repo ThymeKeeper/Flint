@@ -481,6 +481,53 @@ fn task_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "schedule_script_task",
+            description: "Schedule a mechanical task that runs a shell command without LLM. \
+                Much cheaper than schedule_task — use this when the task is just \
+                'run a command and check the output'. The command runs, output is checked \
+                against success_pattern (regex), and if matched the message_template is sent. \
+                Use {output} in the template to include command output.",
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "description": {
+                        "type": "string",
+                        "description": "Human description of what this task monitors"
+                    },
+                    "trigger_type": {
+                        "type": "string",
+                        "enum": ["interval", "cron", "once"],
+                        "description": "How to trigger: interval (recurring by seconds), cron (daily at HH:MM UTC), once (specific time)"
+                    },
+                    "trigger_spec": {
+                        "type": "string",
+                        "description": "Interval in seconds, 'HH:MM' for cron, or RFC3339 timestamp for once"
+                    },
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command to execute"
+                    },
+                    "success_pattern": {
+                        "type": "string",
+                        "description": "Regex pattern — if output matches, state=acted and message is sent. If omitted, exit code 0 = success."
+                    },
+                    "message_template": {
+                        "type": "string",
+                        "description": "Message to send when pattern matches. Use {output} for command output."
+                    },
+                    "max_idle_runs": {
+                        "type": "integer",
+                        "description": "Max consecutive non-matching runs before auto-pausing (default: 10)"
+                    },
+                    "expires_at": {
+                        "type": "string",
+                        "description": "Optional RFC3339 timestamp after which the task expires"
+                    }
+                },
+                "required": ["description", "trigger_type", "trigger_spec", "command"]
+            }),
+        },
+        ToolDefinition {
             name: "delete_task",
             description: "Permanently delete a scheduled task by ID. \
                 Use list_tasks to find the ID. \
@@ -577,7 +624,7 @@ fn format_tool_call(name: &str, input: &Value) -> String {
         "memory_update"  => input["id"].as_str().unwrap_or("").to_string(),
         "memory_delete"  => input["id"].as_str().unwrap_or("").to_string(),
         "spawn_subagent" => trunc(input["task"].as_str().unwrap_or(""), 60),
-        "schedule_task"  => trunc(input["name"].as_str().unwrap_or(""), 60),
+        "schedule_task" | "schedule_script_task" => trunc(input["description"].as_str().unwrap_or(""), 60),
         "list_tasks" | "list_skills" => String::new(),
         "delete_task"    => input["id"].as_str().unwrap_or("").to_string(),
         "create_skill"   => trunc(input["name"].as_str().unwrap_or(""), 60),
@@ -738,9 +785,10 @@ impl ToolExecutor {
             "memory_update"  => self.memory_update(input).await,
             "memory_delete"  => self.memory_delete(input).await,
             "spawn_subagent" => self.spawn_subagent(input).await,
-            "schedule_task"  => self.schedule_task(input).await,
-            "list_tasks"     => self.list_tasks().await,
-            "delete_task"    => self.delete_task(input).await,
+            "schedule_task"        => self.schedule_task(input).await,
+            "schedule_script_task" => self.schedule_script_task(input).await,
+            "list_tasks"           => self.list_tasks().await,
+            "delete_task"          => self.delete_task(input).await,
             "create_skill"   => self.create_skill(input).await,
             "list_skills"    => self.list_skills().await,
             "update_skill"   => self.update_skill(input).await,
@@ -882,6 +930,50 @@ impl ToolExecutor {
         }
     }
 
+    async fn schedule_script_task(&self, input: &Value) -> String {
+        let tasks = match &self.tasks {
+            Some(t) => t,
+            None => return "Error: task scheduling not available in this context".to_string(),
+        };
+        let description = match input["description"].as_str() {
+            Some(d) => d,
+            None => return "Error: missing 'description' field".to_string(),
+        };
+        let trigger_type = match input["trigger_type"].as_str() {
+            Some(t) => t,
+            None => return "Error: missing 'trigger_type' field".to_string(),
+        };
+        let trigger_spec = match input["trigger_spec"].as_str() {
+            Some(s) => s,
+            None => return "Error: missing 'trigger_spec' field".to_string(),
+        };
+        let command = match input["command"].as_str() {
+            Some(c) => c,
+            None => return "Error: missing 'command' field".to_string(),
+        };
+        let success_pattern = input["success_pattern"].as_str();
+        let message_template = input["message_template"].as_str();
+        let max_idle_runs = input["max_idle_runs"].as_i64().unwrap_or(10).max(1);
+        let expires_at = input["expires_at"]
+            .as_str()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|t| t.with_timezone(&chrono::Utc));
+
+        match tasks
+            .create_script(
+                description, trigger_type, trigger_spec, command,
+                success_pattern, message_template, max_idle_runs, expires_at,
+            )
+            .await
+        {
+            Ok(id) => format!(
+                "Script task scheduled (id='{id}'). Trigger: {trigger_type}:{trigger_spec}. \
+                 Command: {command}. No LLM cost per run."
+            ),
+            Err(e) => format!("Error scheduling script task: {e:#}"),
+        }
+    }
+
     async fn list_tasks(&self) -> String {
         let tasks = match &self.tasks {
             Some(t) => t,
@@ -896,6 +988,7 @@ impl ToolExecutor {
                     .map(|t| {
                         serde_json::json!({
                             "id": t.id,
+                            "type": t.task_type,
                             "description": t.description,
                             "trigger": format!("{}:{}", t.trigger_type, t.trigger_spec),
                             "enabled": t.enabled,
@@ -1280,8 +1373,8 @@ mod tests {
     async fn test_executor_tool_definitions() {
         let executor = test_executor().await;
         let defs = executor.tool_definitions();
-        // 4 base + 4 memory + spawn_subagent + 3 task tools + 4 skill tools = 16 (no signal_send, signal_client is None)
-        assert_eq!(defs.len(), 16);
+        // 4 base + 4 memory + spawn_subagent + 4 task tools + 4 skill tools = 17 (no signal_send, signal_client is None)
+        assert_eq!(defs.len(), 17);
         let names: Vec<_> = defs.iter().map(|d| d.name).collect();
         assert!(names.contains(&"spawn_subagent"));
         assert!(names.contains(&"memory_store"));

@@ -41,6 +41,7 @@ fastembed = "5"
 flate2 = "1"
 tar = "0.4"
 ureq = "2"
+regex = "1.12.3"
 
 [build-dependencies]
 ureq = "2"

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use regex::Regex;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
@@ -83,19 +84,21 @@ async fn run_due_tasks(
     for task in &due {
         info!("Running task '{}' ({})", task.id, truncate(&task.description, 60));
 
-        let output =
+        let output = if task.task_type == "script" {
+            execute_script_task(task).await
+        } else {
             match execute_task(task, llm, memory, config.claude.max_tokens).await {
                 Ok(o) => o,
                 Err(e) => {
                     warn!("Task '{}' execution error: {e:#}", task.id);
-                    // Treat errors as nothing_to_do to avoid infinite failure loops.
                     TaskRunOutput {
                         state: TaskRunState::NothingToDo,
                         reason: format!("Execution error: {e:#}"),
                         message: None,
                     }
                 }
-            };
+            }
+        };
 
         info!(
             "Task '{}' → {:?}: {}",
@@ -296,6 +299,83 @@ fn parse_task_output(text: &str) -> Result<TaskRunOutput> {
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string()),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Script task execution (no LLM — purely mechanical)
+// ---------------------------------------------------------------------------
+
+/// Run a script task: execute the command, check output against success_pattern,
+/// and return structured output without any LLM involvement.
+async fn execute_script_task(task: &TaskEntry) -> TaskRunOutput {
+    let command = match &task.command {
+        Some(cmd) => cmd.clone(),
+        None => {
+            return TaskRunOutput {
+                state: TaskRunState::NothingToDo,
+                reason: "Script task has no command configured".to_string(),
+                message: None,
+            }
+        }
+    };
+
+    // Run the command
+    let result = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(&command)
+        .output()
+        .await;
+
+    let (exit_code, stdout, stderr) = match result {
+        Ok(output) => (
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        ),
+        Err(e) => {
+            return TaskRunOutput {
+                state: TaskRunState::NothingToDo,
+                reason: format!("Failed to execute command: {e}"),
+                message: None,
+            }
+        }
+    };
+
+    let combined_output = if stderr.is_empty() {
+        stdout.clone()
+    } else {
+        format!("{stdout}\n{stderr}")
+    };
+
+    // Check success_pattern against output
+    let matched = match &task.success_pattern {
+        Some(pattern) => match Regex::new(pattern) {
+            Ok(re) => re.is_match(&combined_output),
+            Err(e) => {
+                warn!("Invalid success_pattern regex '{}': {e}", pattern);
+                exit_code == 0
+            }
+        },
+        // No pattern — success is determined by exit code
+        None => exit_code == 0,
+    };
+
+    if matched {
+        let message = task.message_template.as_ref().map(|tmpl| {
+            tmpl.replace("{output}", combined_output.trim())
+        });
+        TaskRunOutput {
+            state: TaskRunState::Acted,
+            reason: format!("Command succeeded (exit {})", exit_code),
+            message,
+        }
+    } else {
+        TaskRunOutput {
+            state: TaskRunState::StillWaiting,
+            reason: format!("Pattern not matched (exit {})", exit_code),
+            message: None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -58,12 +58,20 @@ pub struct SignalConfig {
     pub base_url: String,
 }
 
+fn default_utility_model() -> String {
+    "claude-haiku-4-5-latest".to_string()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClaudeConfig {
     pub model: String,
     pub max_tokens: usize,
     pub context_limit: usize,
     pub compaction_threshold: f64,
+    /// Cheaper model for background work (memory extraction, consolidation, compaction).
+    /// Defaults to Haiku.
+    #[serde(default = "default_utility_model")]
+    pub utility_model: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

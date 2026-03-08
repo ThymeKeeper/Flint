@@ -64,6 +64,14 @@ pub struct TaskEntry {
     pub idle_count: i64,
     pub max_idle_runs: i64,
     pub expires_at: Option<DateTime<Utc>>,
+    /// "llm" (default) or "script". Script tasks run mechanically without LLM.
+    pub task_type: String,
+    /// Shell command to run (script tasks only).
+    pub command: Option<String>,
+    /// Regex pattern — if output matches, state=acted (script tasks only).
+    pub success_pattern: Option<String>,
+    /// Template for user message. Use `{output}` placeholder (script tasks only).
+    pub message_template: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -75,29 +83,42 @@ pub struct TaskManager {
 }
 
 const DDL: &str = "CREATE TABLE IF NOT EXISTS tasks (
-    id            VARCHAR PRIMARY KEY,
-    description   VARCHAR NOT NULL,
-    trigger_type  VARCHAR NOT NULL,
-    trigger_spec  VARCHAR NOT NULL,
-    enabled       BOOLEAN NOT NULL DEFAULT true,
-    created_at    VARCHAR NOT NULL,
-    last_run      VARCHAR,
-    next_run      VARCHAR NOT NULL,
-    run_count     INTEGER NOT NULL DEFAULT 0,
-    idle_count    INTEGER NOT NULL DEFAULT 0,
-    max_idle_runs INTEGER NOT NULL DEFAULT 10,
-    expires_at    VARCHAR
+    id               VARCHAR PRIMARY KEY,
+    description      VARCHAR NOT NULL,
+    trigger_type     VARCHAR NOT NULL,
+    trigger_spec     VARCHAR NOT NULL,
+    enabled          BOOLEAN NOT NULL DEFAULT true,
+    created_at       VARCHAR NOT NULL,
+    last_run         VARCHAR,
+    next_run         VARCHAR NOT NULL,
+    run_count        INTEGER NOT NULL DEFAULT 0,
+    idle_count       INTEGER NOT NULL DEFAULT 0,
+    max_idle_runs    INTEGER NOT NULL DEFAULT 10,
+    expires_at       VARCHAR,
+    task_type        VARCHAR NOT NULL DEFAULT 'llm',
+    command          VARCHAR,
+    success_pattern  VARCHAR,
+    message_template VARCHAR
 )";
+
+/// Migration to add script task columns to existing databases.
+const MIGRATE_SCRIPT_COLS: &str = "
+    ALTER TABLE tasks ADD COLUMN IF NOT EXISTS task_type VARCHAR NOT NULL DEFAULT 'llm';
+    ALTER TABLE tasks ADD COLUMN IF NOT EXISTS command VARCHAR;
+    ALTER TABLE tasks ADD COLUMN IF NOT EXISTS success_pattern VARCHAR;
+    ALTER TABLE tasks ADD COLUMN IF NOT EXISTS message_template VARCHAR;
+";
 
 impl TaskManager {
     /// Share the MemoryManager's DuckDB connection (one connection, no conflicts).
     pub async fn new(db: Arc<Mutex<Connection>>) -> Result<Self> {
         let db2 = db.clone();
         tokio::task::spawn_blocking(move || {
-            db2.lock()
-                .unwrap()
-                .execute_batch(DDL)
-                .context("create tasks table")
+            let conn = db2.lock().unwrap();
+            conn.execute_batch(DDL).context("create tasks table")?;
+            // Migrate existing databases that lack the script task columns.
+            let _ = conn.execute_batch(MIGRATE_SCRIPT_COLS);
+            Ok::<(), anyhow::Error>(())
         })
         .await
         .context("spawn_blocking")??;
@@ -162,6 +183,60 @@ impl TaskManager {
     }
 
     // -----------------------------------------------------------------------
+    // create_script — mechanical task (no LLM)
+    // -----------------------------------------------------------------------
+
+    pub async fn create_script(
+        &self,
+        description: &str,
+        trigger_type: &str,
+        trigger_spec: &str,
+        command: &str,
+        success_pattern: Option<&str>,
+        message_template: Option<&str>,
+        max_idle_runs: i64,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        let next_run =
+            compute_next_run(trigger_type, trigger_spec, None).unwrap_or(now);
+
+        let id2 = id.clone();
+        let desc = description.to_string();
+        let tt = trigger_type.to_string();
+        let ts = trigger_spec.to_string();
+        let cmd = command.to_string();
+        let pat = success_pattern.map(|s| s.to_string());
+        let tmpl = message_template.map(|s| s.to_string());
+        let now_s = now.to_rfc3339();
+        let next_s = next_run.to_rfc3339();
+        let exp_s: Option<String> = expires_at.map(|t| t.to_rfc3339());
+        let db = self.db.clone();
+
+        tokio::task::spawn_blocking(move || {
+            db.lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO tasks
+                     (id, description, trigger_type, trigger_spec, enabled,
+                      created_at, last_run, next_run, run_count, idle_count,
+                      max_idle_runs, expires_at, task_type, command,
+                      success_pattern, message_template)
+                     VALUES (?, ?, ?, ?, true, ?, NULL, ?, 0, 0, ?, ?, 'script', ?, ?, ?)",
+                    duckdb::params![id2, desc, tt, ts, now_s, next_s, max_idle_runs, exp_s, cmd, pat, tmpl],
+                )
+                .map(|_| ())
+                .context("insert script task")
+        })
+        .await
+        .context("spawn_blocking")??;
+
+        info!("Script task created: {id} ({trigger_type}:{trigger_spec})");
+        Ok(id)
+    }
+
+    // -----------------------------------------------------------------------
     // due — tasks whose next_run has passed and haven't expired
     // -----------------------------------------------------------------------
 
@@ -174,7 +249,8 @@ impl TaskManager {
                 .prepare(
                     "SELECT id, description, trigger_type, trigger_spec, enabled,
                             created_at, last_run, next_run, run_count, idle_count,
-                            max_idle_runs, expires_at
+                            max_idle_runs, expires_at, task_type, command,
+                            success_pattern, message_template
                      FROM tasks
                      WHERE enabled = true AND next_run <= ?
                        AND (expires_at IS NULL OR expires_at > ?)",
@@ -201,7 +277,8 @@ impl TaskManager {
                 .prepare(
                     "SELECT id, description, trigger_type, trigger_spec, enabled,
                             created_at, last_run, next_run, run_count, idle_count,
-                            max_idle_runs, expires_at
+                            max_idle_runs, expires_at, task_type, command,
+                            success_pattern, message_template
                      FROM tasks ORDER BY created_at DESC",
                 )
                 .context("prepare list")?;
@@ -389,6 +466,10 @@ fn row_to_entry(row: &duckdb::Row<'_>) -> duckdb::Result<TaskEntry> {
         idle_count: row.get(9)?,
         max_idle_runs: row.get(10)?,
         expires_at: expires_s.as_deref().map(parse_ts),
+        task_type: row.get::<_, String>(12).unwrap_or_else(|_| "llm".to_string()),
+        command: row.get(13).ok(),
+        success_pattern: row.get(14).ok(),
+        message_template: row.get(15).ok(),
     })
 }
 

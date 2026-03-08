@@ -144,6 +144,7 @@ mod tests {
             max_tokens: 4096,
             context_limit: 200000,
             compaction_threshold: 0.75,
+            utility_model: "test".to_string(),
         }
     }
 
@@ -178,6 +179,7 @@ mod tests {
             max_tokens: 100,
             context_limit: 100, // 75% = 75 tokens
             compaction_threshold: 0.75,
+            utility_model: "test".to_string(),
         };
         let mut ctx = ConversationContext::new(config);
         assert!(!ctx.compaction_needed());

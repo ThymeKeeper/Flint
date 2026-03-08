@@ -65,9 +65,23 @@ async fn main() -> Result<()> {
     let _soul_watcher = clawd::config::spawn_soul_watcher(soul_path, soul.clone())
         .context("Failed to start soul watcher")?;
 
-    // ── LLM client ───────────────────────────────────────────────────────────
-    let llm: Arc<dyn clawd::claude::LlmClient> =
-        Arc::new(ClaudeClient::new(anthropic_key, config.claude.clone()));
+    // ── Resolve latest models ──────────────────────────────────────────────
+    let main_model = resolve_model(&anthropic_key, &config.claude.model).await;
+    let utility_model = resolve_model(&anthropic_key, &config.claude.utility_model).await;
+    info!("Models: main={main_model}, utility={utility_model}");
+
+    // ── LLM clients ──────────────────────────────────────────────────────────
+    let llm: Arc<dyn clawd::claude::LlmClient> = Arc::new(ClaudeClient::with_model(
+        anthropic_key.clone(),
+        config.claude.clone(),
+        main_model,
+    ));
+    // Cheap model for background memory work (extraction, consolidation, compaction)
+    let utility_llm: Arc<dyn clawd::claude::LlmClient> = Arc::new(ClaudeClient::with_model(
+        anthropic_key,
+        config.claude.clone(),
+        utility_model,
+    ));
 
     // ── Embedding client (bundled BGE-small-en-v1.5-Q, no API key needed) ──────
     let embedder: Arc<dyn clawd::embeddings::EmbeddingClient> =
@@ -194,6 +208,7 @@ async fn main() -> Result<()> {
     let agent = Arc::new(Agent::new(
         soul.clone(),
         llm.clone(),
+        utility_llm,
         memory.clone(),
         tasks.clone(),
         skills.clone(),
@@ -517,4 +532,50 @@ fn resolve_config_path() -> Result<PathBuf> {
     }
 
     bail!("Cannot determine home directory. Use --config <path>.");
+}
+
+// ---------------------------------------------------------------------------
+// Model resolution
+// ---------------------------------------------------------------------------
+
+/// Extract the model family prefix from a model string.
+/// "claude-sonnet-4-6-latest" → "claude-sonnet"
+/// "claude-haiku-4-5-20251001" → "claude-haiku"
+/// "claude-opus-4-6" → "claude-opus"
+fn model_family(model: &str) -> Option<&str> {
+    // Family is everything before the first digit segment: "claude-{name}-{version...}"
+    // Find the position of the first '-' followed by a digit.
+    let bytes = model.as_bytes();
+    for i in 1..bytes.len() {
+        if bytes[i - 1] == b'-' && bytes[i].is_ascii_digit() {
+            return Some(&model[..i - 1]);
+        }
+    }
+    None
+}
+
+/// Resolve a model config value to the latest concrete model ID.
+/// If the config already contains "-latest", use it as-is (the API resolves it).
+/// Otherwise, query the models API to find the latest in that family.
+/// Falls back to the original config value on any failure.
+async fn resolve_model(api_key: &str, configured: &str) -> String {
+    if configured.ends_with("-latest") {
+        return configured.to_string();
+    }
+    let family = match model_family(configured) {
+        Some(f) => f,
+        None => return configured.to_string(),
+    };
+    match ClaudeClient::resolve_latest_model(api_key, family).await {
+        Some(resolved) => {
+            if resolved != configured {
+                info!("Resolved {configured} → {resolved}");
+            }
+            resolved
+        }
+        None => {
+            warn!("Could not resolve latest model for '{family}', using '{configured}'");
+            configured.to_string()
+        }
+    }
 }
