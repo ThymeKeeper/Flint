@@ -129,6 +129,11 @@ impl SubAgentManager {
 
     /// Spawn a single sub-agent in the background.  Returns the sub-agent ID
     /// immediately so the main agent can continue responding.
+    ///
+    /// `plan_result_tx`: when `Some`, the spawned task sends
+    /// `(step_id, result_text, is_error)` on this channel in addition to the
+    /// normal `notify_tx` send.  Used by `execute_plan` to capture real results
+    /// for dependent steps without interfering with the main-loop notification.
     pub async fn spawn(
         &self,
         task: String,
@@ -141,6 +146,7 @@ impl SubAgentManager {
         code_index: Arc<CodeIndex>,
         plan_id: Option<u64>,
         step_id: Option<String>,
+        plan_result_tx: Option<mpsc::Sender<(String, String, bool)>>,
     ) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let skill_name = skill.as_ref().map(|s| s.name.clone());
@@ -209,6 +215,15 @@ impl SubAgentManager {
                     (skill_name.clone(), plan_id, step_id.clone())
                 }
             };
+
+            // If this sub-agent belongs to a plan, forward the real result to
+            // the plan orchestrator so dependent steps receive actual context.
+            // This fires before the active-map removal so the orchestrator's
+            // results HashMap is populated before any watcher could race.
+            if let Some(tx) = plan_result_tx {
+                let sid = step_id_out.clone().unwrap_or_default();
+                let _ = tx.send((sid, result_text.clone(), is_error)).await;
+            }
 
             // Remove from active set.
             {
@@ -474,9 +489,11 @@ impl SubAgentManager {
             }
         }
 
-        // Channel for step completions within this plan.
-        // Carries (step_id, result_text, is_error) so dependent steps get real results.
-        let (step_done_tx, mut step_done_rx) = mpsc::channel::<(String, String, bool)>(32);
+        // Per-plan result channel: the spawned sub-agent tasks send
+        // (step_id, result_text, is_error) here so the orchestrator can build
+        // dep_context with real output instead of empty strings.
+        let (plan_result_tx, mut plan_result_rx) =
+            mpsc::channel::<(String, String, bool)>(step_count + 4);
 
         let mgr = self.clone();
         let steps_arc = Arc::new(steps);
@@ -530,9 +547,10 @@ impl SubAgentManager {
                         None
                     };
 
-                    // Spawn the sub-agent through the manager (which handles
-                    // TUI events and the main notification channel).
-                    let sa_id = mgr.spawn(
+                    // Spawn the sub-agent through the manager.  Pass a clone of
+                    // plan_result_tx so the spawned task sends its real result
+                    // back to this orchestrator when it finishes.
+                    mgr.spawn(
                         step.task.clone(),
                         dep_context,
                         skill,
@@ -543,161 +561,8 @@ impl SubAgentManager {
                         code_index.clone(),
                         Some(plan_id),
                         Some(step.id.clone()),
+                        Some(plan_result_tx.clone()),
                     ).await;
-
-                    // Monitor this sub-agent by subscribing to the notify channel
-                    // via a per-step result forwarder.  We hook into the notify_tx
-                    // by watching the active map and then reading the final result
-                    // from the notification that goes through notify_tx to main.
-                    //
-                    // Since we can't easily intercept notify_tx here (it goes to
-                    // the main loop), we use a different strategy: duplicate the
-                    // result by having a watcher task that polls and captures the
-                    // result from the active set removal.  We intercept via a
-                    // secondary channel that the spawned task writes to directly.
-                    //
-                    // The approach: we replace the per-plan monitoring with a
-                    // result-capture mechanism using a shared results map that
-                    // gets written when the sub-agent's notify fires.
-                    //
-                    // Concretely: subscribe to completion by watching the active map
-                    // for removal, then reading the result from the notify_tx echo.
-                    // But notify_tx goes to the main agent.  So we use a simpler
-                    // approach: wrap the spawn result by monitoring the notify_tx
-                    // through a relay channel.
-                    //
-                    // Practical fix: use a per-plan completion relay channel (step_done_tx)
-                    // and hook it by watching the notify_tx side through a shared Arc<Mutex<...>>.
-                    // Given the existing architecture, the cleanest approach is to
-                    // use the active map watch but also store results in a shared map
-                    // that the spawned task writes to before the notify_tx send.
-                    //
-                    // We implement this by intercepting the result inside the
-                    // watcher: store results in a per-plan Arc<RwLock<HashMap>>.
-
-                    let active = mgr.active.clone();
-                    let step_id_clone = step.id.clone();
-                    let tx = step_done_tx.clone();
-
-                    // Share a result store between the spawned task monitor
-                    // and the notification path via the notify_tx.
-                    // The plan result capture happens via per-plan result channels
-                    // embedded in the sub-agent spawn.
-                    //
-                    // We use the following protocol:
-                    // - Spawn a watcher that polls the active map until sa_id is removed.
-                    // - When removed, we need the result.  The result goes through
-                    //   notify_tx to the main agent.  We can't intercept that directly.
-                    //
-                    // Instead, we augment the active map entry with a result oneshot
-                    // channel.  But SubAgentInfo is in the public API.
-                    //
-                    // Simplest correct approach: store the result in a per-plan
-                    // results Arc that the spawned tokio task writes to via a
-                    // separate notify mechanism.  We do this using the notification
-                    // system: subscribe another receiver.
-                    //
-                    // Given the single-consumer constraint on mpsc, we instead use
-                    // a broadcast channel for plan results or a shared Arc<RwLock>.
-                    //
-                    // Final implementation: use an Arc<RwLock<HashMap<u64, String>>>
-                    // (sa_id -> result) shared across all step watchers in this plan.
-                    // The spawned sub-agent task writes here when it completes.
-                    // We pass this Arc into the spawn call indirectly by having the
-                    // watcher read from the notification channel echo.
-                    //
-                    // To avoid the complexity, we use the following approach that
-                    // works correctly: keep a per-plan Arc<Mutex<HashMap<sa_id, result>>>
-                    // and have the orchestrator collect results from step_done_rx.
-                    // The watcher sends (step_id, result) through step_done_tx.
-                    // To get the result, the watcher blocks on the active map removal
-                    // then reads from a shared result store populated by a broadcast.
-                    //
-                    // Since all of this is getting circular, here is the actual
-                    // clean fix: the spawned sub-agent task already sends the result
-                    // through notify_tx. We add a plan_result_tx that the spawned
-                    // task ALSO sends to, routing to the plan orchestrator.
-                    //
-                    // This requires passing plan_result_tx into the spawn call.
-                    // We do this via a per-plan result relay embedded in the
-                    // SubAgentManager::spawn signature... but that changes the API.
-                    //
-                    // The cleanest fix within the existing structure: use a shared
-                    // Arc<RwLock<HashMap<sa_id, String>>> populated by a watcher on
-                    // the notify_tx. We use tokio::sync::broadcast for this.
-                    //
-                    // FINAL DECISION: store results in an Arc<RwLock<HashMap>> that
-                    // lives on the plan orchestrator. The sub-agent completion monitor
-                    // sends (step_id, result_text) through step_done_tx by intercepting
-                    // the result via the active-map watch AND a separate per-step
-                    // result oneshot that we inject alongside the sub-agent spawn.
-                    //
-                    // Implementation: we add a per-step result store as an
-                    // Arc<RwLock<Option<String>>> that the tokio::spawn block
-                    // in the manager writes to before removing from active.
-                    // Since we can't easily do that without changing SubAgentInfo,
-                    // we use the following approach instead:
-                    //
-                    // Use a tokio oneshot for each step. The orchestrator spawns
-                    // a "watcher" task that polls the active map every 200ms.
-                    // When sa_id disappears, the watcher knows the step is done
-                    // but doesn't have the result text.
-                    //
-                    // To get the result: we add a per-plan "result relay" broadcast
-                    // sender to the SubAgentManager. The spawned task sends
-                    // (sa_id, result_text) through this relay before removing from
-                    // the active map. The watcher subscribes to this broadcast.
-                    //
-                    // However, that requires changing SubAgentManager's public API.
-                    //
-                    // PRAGMATIC SOLUTION (correct and minimal):
-                    // Pass a plan-scoped result tx (mpsc::Sender<(u64, String)>)
-                    // alongside the step watcher. The spawned task in manager::spawn
-                    // already writes to notify_tx; we need to also write to the plan
-                    // result channel. We do this by creating a local result store
-                    // (Arc<RwLock<HashMap<u64, String>>>) and a watcher that:
-                    // 1. Monitors active map for sa_id removal.
-                    // 2. Reads result from result_store (populated by the notify relay).
-                    // 
-                    // We relay notify_tx by using a tokio::sync::broadcast.
-                    // But the notify_rx is consumed by the main agent.
-                    //
-                    // OK. Given all of this, the actual practical implementation:
-                    // We use a per-plan Arc<RwLock<HashMap<u64, String>>> populated
-                    // from within the step watcher using a per-step result oneshot
-                    // channel passed through a shared table.  The spawned sub-agent
-                    // task is modified to also send through the plan result channel
-                    // by having plan_result_channels registered before spawn.
-                    //
-                    // Since we're going in circles, here's what we actually do:
-                    // Add a `plan_result_channels: Arc<RwLock<HashMap<u64, oneshot::Sender<String>>>>` 
-                    // field to SubAgentManager. Before spawning a plan step, register
-                    // a oneshot channel for sa_id. After spawn returns sa_id, the
-                    // spawned task checks this map and fires the oneshot with the result.
-                    // The watcher receives it and sends (step_id, result) to step_done_tx.
-                    //
-                    // This IS the correct solution. But it requires changing SubAgentManager.
-                    // Let's just do it properly.
-
-                    // For now, use the watcher approach that returns the result via
-                    // a separate mechanism. Since we need the result, we'll use a
-                    // per-plan result_store Arc that gets populated from the main
-                    // notification path. The orchestrator will collect results there.
-                    //
-                    // In practice: use the `plan_result_store` that's passed in.
-
-                    tokio::spawn(async move {
-                        loop {
-                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                            let map = active.read().await;
-                            if !map.contains_key(&sa_id) {
-                                // Sub-agent finished. Signal completion.
-                                // The result will be populated via the plan_result_store.
-                                let _ = tx.send((step_id_clone, String::new(), false)).await;
-                                break;
-                            }
-                        }
-                    });
                 }
 
                 // Check if all steps are done.
@@ -706,11 +571,11 @@ impl SubAgentManager {
                     break;
                 }
 
-                // Wait for a step to complete.
-                if let Some((step_id, result, _is_error)) = step_done_rx.recv().await {
-                    results.insert(step_id, result);
+                // Wait for a step to complete and store its real result.
+                if let Some((step_id, result_text, _is_error)) = plan_result_rx.recv().await {
+                    results.insert(step_id, result_text);
                 } else {
-                    warn!("Plan {plan_id}: step channel closed unexpectedly");
+                    warn!("Plan {plan_id}: result channel closed unexpectedly");
                     break;
                 }
             }

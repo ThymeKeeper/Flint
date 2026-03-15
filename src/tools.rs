@@ -1385,6 +1385,7 @@ impl ToolExecutor {
                 self.code_index.clone(),
                 None,
                 None,
+                None, // plan_result_tx: not a plan step
             ).await;
             let task_preview = trunc(task, 120);
             return serde_json::json!({
