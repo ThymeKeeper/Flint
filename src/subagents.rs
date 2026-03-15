@@ -51,15 +51,24 @@ pub struct SubAgentNotification {
 impl SubAgentNotification {
     /// Format as a synthetic message for the primary agent.
     pub fn to_agent_text(&self) -> String {
+        const EXCERPT_LEN: usize = 600;
+        let (excerpt, truncated) = if self.result.chars().count() > EXCERPT_LEN {
+            let t: String = self.result.chars().take(EXCERPT_LEN).collect();
+            (t, true)
+        } else {
+            (self.result.clone(), false)
+        };
+        let truncation_note = if truncated { " [truncated]" } else { "" };
+
         if self.is_error {
             format!(
-                "[Sub-agent {} failed]\nTask: {}\nError: {}",
-                self.id, self.task, self.result,
+                "[Sub-agent {} failed]\nTask: {}\nError excerpt: {}{}",
+                self.id, self.task, excerpt, truncation_note,
             )
         } else {
             format!(
-                "[Sub-agent {} completed]\nTask: {}\nResult: {}",
-                self.id, self.task, self.result,
+                "[Sub-agent {} completed]\nTask: {}\nResult excerpt: {}{}\n\nSynthesise the above in your own words for the user. Do not quote the raw output verbatim.",
+                self.id, self.task, excerpt, truncation_note,
             )
         }
     }

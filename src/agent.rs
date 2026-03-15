@@ -343,7 +343,7 @@ impl Agent {
              - **Complex analysis**: chain sub-agents where each step builds on the previous using `plan_subagents`.\n\
              - Sub-agents run in the BACKGROUND — you stay responsive to the user.\n\
              - The user can see live sub-agent activity in TUI activity boxes.\n\
-             - When a sub-agent finishes, you will be prompted to relay its results.\n\
+             - When a sub-agent finishes, you receive a compact notification with a brief excerpt. Synthesise the result in your own words — never quote the raw sub-agent output verbatim into chat. Report what the user needs to know, concisely, as if you are briefing them on what your colleague found.\n\
              - Use `spawn_subagent` for simple one-off delegations.\n\
              - Use `plan_subagents` for complex workflows with dependencies.\n\
              - Use `list_subagents` to check on running sub-agents.\n\
