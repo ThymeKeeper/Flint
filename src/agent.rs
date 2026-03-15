@@ -391,11 +391,35 @@ impl Agent {
              code_find_references, code_diagnostics.".to_string()
         };
 
+        // Inject active sub-agents section if any are running.
+        let active_subagents = self.subagent_mgr.list().await;
+        let subagents_section = if active_subagents.is_empty() {
+            String::new()
+        } else {
+            let lines: Vec<String> = active_subagents
+                .iter()
+                .map(|sa| {
+                    let skill_part = sa.skill.as_deref()
+                        .map(|s| format!(" | skill: {s}"))
+                        .unwrap_or_default();
+                    format!("- ID {} | task: \"{}\" {skill_part}| running for {}s",
+                        sa.id, sa.task, sa.elapsed_secs)
+                })
+                .collect();
+            format!(
+                "\n## Active Sub-Agents\n\
+                 The following sub-agents are currently running. Do not duplicate their work.\n\n\
+                 {}\n",
+                lines.join("\n")
+            )
+        };
+
         format!(
             "{base_prompt}{signal_section}{arch_section}\
              {memory_section}\n\n\
              Use the retrieved memories above to provide personalized, contextual responses. \
-             Reference past conversations naturally when relevant, but don't force it.\n\n\
+             Reference past conversations naturally when relevant, but don't force it.\
+             {subagents_section}\n\n\
              ## Tool Use\n\
              {tool_section}"
         )

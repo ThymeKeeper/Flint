@@ -735,6 +735,7 @@ pub fn format_tool_call(name: &str, input: &Value) -> String {
             format!("{n} steps")
         },
         "list_subagents"       => String::new(),
+        "cancel_subagent"      => input["id"].as_u64().map(|i| i.to_string()).unwrap_or_default(),
         _                => trunc(&input.to_string(), 72),
     };
     if detail.is_empty() {
@@ -982,7 +983,8 @@ impl ToolExecutor {
             "memory_delete"  => self.memory_delete(input).await,
             "spawn_subagent" => self.spawn_subagent_dispatch(input).await,
             "plan_subagents" => self.plan_subagents(input).await,
-            "list_subagents" => self.list_subagents().await,
+            "list_subagents"  => self.list_subagents().await,
+            "cancel_subagent" => self.cancel_subagent_dispatch(input).await,
             "schedule_task"        => self.schedule_task(input).await,
             "schedule_script_task" => self.schedule_script_task(input).await,
             "list_tasks"           => self.list_tasks().await,
@@ -1384,11 +1386,12 @@ impl ToolExecutor {
                 None,
                 None,
             ).await;
-            return format!(
-                "sub-agent:{id} started in background — working on: {}. \
-                 You will be notified when it completes.",
-                trunc(task, 60)
-            );
+            let task_preview = trunc(task, 120);
+            return serde_json::json!({
+                "sub_agent_id": id,
+                "status": "running",
+                "task": task_preview,
+            }).to_string();
         }
 
         // Blocking fallback (no SubAgentManager — e.g. task runners).
@@ -1509,6 +1512,27 @@ impl ToolExecutor {
         .await
     }
 
+
+    // -----------------------------------------------------------------------
+    // cancel_subagent — cancel a running sub-agent
+    // -----------------------------------------------------------------------
+
+    async fn cancel_subagent_dispatch(&self, input: &Value) -> String {
+        let mgr = match &self.subagent_mgr {
+            Some(m) => m,
+            None => return "No sub-agent manager available".to_string(),
+        };
+        let id = match input["id"].as_u64() {
+            Some(i) => i,
+            None => return "Error: missing or invalid 'id' field — must be a numeric sub-agent ID".to_string(),
+        };
+        if mgr.cancel(id).await {
+            format!("Sub-agent {id} cancellation requested. It will stop at the next safe point.")
+        } else {
+            format!("No active sub-agent with ID {id}. Use list_subagents to see running agents.")
+        }
+    }
+
     // -----------------------------------------------------------------------
     // list_subagents — show active sub-agents
     // -----------------------------------------------------------------------
@@ -1533,6 +1557,7 @@ impl ToolExecutor {
                     "skill": sa.skill,
                     "plan_id": sa.plan_id,
                     "step_id": sa.step_id,
+                    "elapsed_secs": sa.elapsed_secs,
                 })
             })
             .collect();
