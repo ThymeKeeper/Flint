@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::claude::{ApiMessage, ClaudeClient, ClaudeRequest, ContentBlock, LlmClient, MessageContent};
+use crate::claude::{ApiMessage, ClaudeClient, ClaudeRequest, ContentBlock, LlmClient, MessageContent, ToolDefinition};
 use crate::config::{AppConfig, Soul};
 use crate::context::{ConversationContext, Role};
 use crate::conversation_store::{ConversationStore, StoredTurn, ToolLogEntry};
@@ -95,30 +95,7 @@ impl Agent {
         let mem_id_sims: Vec<(String, f64)> =
             memories.iter().map(|m| (m.id.clone(), m.similarity)).collect();
 
-        // 2. Build system prompt
-        let system_prompt = self.build_system_prompt(&memories, channel).await;
-
-        // 3. Push user message to context and persist to DB.
-        //    Annotate Signal turns so the agent can identify them in the live context,
-        //    matching the annotations applied when turns are reloaded from DuckDB.
-        {
-            let ctx_text = if channel == "signal" {
-                format!("[Signal] {text}")
-            } else {
-                text.to_string()
-            };
-            let mut ctx = self.context.write().await;
-            ctx.push(Role::User, ctx_text);
-        }
-        if let Err(e) = self.conv_store.push("default", sender, "user", text, channel, &[]) {
-            warn!("Failed to persist user turn: {e:#}");
-        }
-
-        // 4. Compact context if needed
-        self.compact_context_if_needed().await?;
-
-        // 5. Generate response via Claude, running the tool loop until done.
-        //    If an observer is provided (TUI), text is streamed live.
+        // 2. Build executor + tool_defs first so the system prompt reflects live tool set.
         let soul_context = {
             let soul = self.soul.read().await;
             soul.to_subagent_context()
@@ -137,11 +114,36 @@ impl Agent {
             observer:        observer.clone(),
             code_index:      self.code_index.clone(),
         });
+        let tool_defs = executor.tool_definitions();
+
+        // 3. Build system prompt — derives tool list dynamically from live tool_defs.
+        let system_prompt = self.build_system_prompt(&memories, channel, Some(&tool_defs)).await;
+
+        // 4. Push user message to context and persist to DB.
+        //    Annotate Signal turns so the agent can identify them in the live context,
+        //    matching the annotations applied when turns are reloaded from DuckDB.
+        {
+            let ctx_text = if channel == "signal" {
+                format!("[Signal] {text}")
+            } else {
+                text.to_string()
+            };
+            let mut ctx = self.context.write().await;
+            ctx.push(Role::User, ctx_text);
+        }
+        if let Err(e) = self.conv_store.push("default", sender, "user", text, channel, &[]) {
+            warn!("Failed to persist user turn: {e:#}");
+        }
+
+        // 5. Compact context if needed
+        self.compact_context_if_needed().await?;
+
+        // 6. Generate response via Claude, running the tool loop until done.
+        //    If an observer is provided (TUI), text is streamed live.
         let mut messages = {
             let ctx = self.context.read().await;
             ClaudeClient::messages_from_context(&ctx)
         };
-        let tool_defs = executor.tool_definitions();
         let mut tool_log: Vec<ToolLogEntry> = Vec::new();
         let final_text = loop {
             let req = ClaudeRequest {
@@ -248,7 +250,15 @@ impl Agent {
     }
 
     /// Build the system prompt from soul + retrieved memories + date + tool guidelines.
-    async fn build_system_prompt(&self, memories: &[MemoryRef], channel: &str) -> String {
+    ///
+    /// `tool_defs` is `Some(&[ToolDefinition])` in normal operation (executor already built),
+    /// or `None` in tests/fallback paths, where a minimal static placeholder is used.
+    async fn build_system_prompt(
+        &self,
+        memories: &[MemoryRef],
+        _channel: &str,
+        tool_defs: Option<&[ToolDefinition]>,
+    ) -> String {
         let soul = self.soul.read().await;
         let base_prompt = soul.to_system_prompt();
         let memory_section = MemoryManager::format_memories_for_prompt(memories);
@@ -310,19 +320,44 @@ impl Agent {
              `memory_search` to query them.\n\
              - **Background tasks**: Scheduled tasks run independently and report via Signal.\n";
 
-        // signal_send is only available from TUI — Signal replies are delivered
-        // automatically by the daemon, so the model must never call signal_send
-        // when responding to a Signal message.
-        let tool_list = if self.config.signal.is_some() && channel != "signal" {
-            "shell_exec, file_read, file_write, web_fetch, memory_store, memory_search, \
-             memory_update, memory_delete, spawn_subagent, schedule_task, schedule_script_task, \
-             list_tasks, delete_task, create_skill, list_skills, update_skill, delete_skill, signal_send, \
-             code_symbols, code_goto_definition, code_find_references, code_diagnostics."
+        // Generate the tool section dynamically from live ToolDefinition structs,
+        // so flint always has accurate self-knowledge about its tools.
+        // Falls back to a minimal static string when called without live tool defs (e.g. tests).
+        let tool_section = if let Some(defs) = tool_defs {
+            let auto = crate::tools::tools_to_prompt_section(defs);
+            format!(
+                "{auto}\
+                 - file_write: if the target already exists OR is a system path (/etc, /usr, /bin, /sbin, /boot, /lib, /sys, /proc), ask the user for confirmation first, then retry with force=true.\n\
+                 - shell_exec: ask before destructive commands (rm, rmdir, dd, mkfs, etc.). Use background=true for EVERYTHING except trivial read-only commands that finish in <5 seconds (ls, cat, grep, ps, df, date, etc.). When in doubt, background=true. NEVER re-run a command that already appears in a [Tools called this turn] block from a previous turn — it is already running or completed.\n\
+                 - memory_store: create a new memory. Use whenever the user asks you to remember something, or when you learn an important fact. Set pinned=true for explicit user requests.\n\
+                 - memory_search: find memories by semantic query.\n\
+                 - memory_update: correct or replace a memory's content; re-embeds automatically.\n\
+                 - memory_delete: permanently remove a fully obsolete memory.\n\
+                 - spawn_subagent: delegate a self-contained task to an isolated sub-agent.\n\
+                 - schedule_task: create a background task that runs autonomously on a schedule (uses LLM). The task runner has shell_exec, web_fetch, file_read, file_write, memory_search, and memory_store. Use trigger_type='interval' (seconds), 'cron' (HH:MM UTC), or 'once' (RFC3339 timestamp). Set max_idle_runs higher (e.g. 100) for long-wait monitoring — the runner uses 'still_waiting' state to stay alive without wasting idle budget.\n\
+                 - schedule_script_task: create a mechanical background task (NO LLM cost). Runs a shell command and checks output against a regex pattern. Prefer this over schedule_task when the task is just 'run a command and check the result'. Use {{output}} in message_template.\n\
+                 - list_tasks: show all scheduled tasks with their status and next run time.\n\
+                 - delete_task: cancel and remove a scheduled task by ID.\n\
+                 - create_skill: define a named sub-agent profile with a custom system prompt and tool set. Sub-agents always inherit the user's principal context automatically.\n\
+                 - list_skills: show defined skills before creating new ones or spawning.\n\
+                 - update_skill: modify a skill's prompt, description, or tools.\n\
+                 - delete_skill: remove a skill by name.\n\
+                 - spawn_subagent accepts an optional skill='name' parameter to use a skill profile.\n\
+                 - code_symbols: list function/struct/class/table definitions in a file or directory WITHOUT reading the full file contents. Use this FIRST to orient yourself in unfamiliar code — it is much cheaper than file_read for understanding structure.\n\
+                 - code_goto_definition: find where a symbol is defined. Give a file path, line, and column.\n\
+                 - code_find_references: find every usage of a symbol across a project directory.\n\
+                 - code_diagnostics: check a file for syntax errors and lint issues (Rust via ra_ap_syntax, Python via rustpython-parser, SQL via sqlparser + sqruff). Enhanced beyond basic tree-sitter — catches real parse errors and SQL lint violations natively without external tools.\n\
+                 - When doing coding work, prefer code_symbols to scan structure before reading files. Read only the specific sections you need, not entire files.\n\
+                 - All other operations: proceed without asking.\n\
+                 - IMPORTANT: After using tools, your final response MUST describe what you did and include the relevant output. This is the only record that persists across conversations."
+            )
         } else {
-            "shell_exec, file_read, file_write, web_fetch, memory_store, memory_search, \
-             memory_update, memory_delete, spawn_subagent, schedule_task, schedule_script_task, \
-             list_tasks, delete_task, create_skill, list_skills, update_skill, delete_skill, \
-             code_symbols, code_goto_definition, code_find_references, code_diagnostics."
+            // Fallback: minimal static string used in tests or edge cases without a live executor.
+            "Tools available: shell_exec, file_read, file_write, web_fetch, memory_store, \
+             memory_search, memory_update, memory_delete, spawn_subagent, schedule_task, \
+             schedule_script_task, list_tasks, delete_task, create_skill, list_skills, \
+             update_skill, delete_skill, code_symbols, code_goto_definition, \
+             code_find_references, code_diagnostics.".to_string()
         };
 
         format!(
@@ -331,41 +366,7 @@ impl Agent {
              Use the retrieved memories above to provide personalized, contextual responses. \
              Reference past conversations naturally when relevant, but don't force it.\n\n\
              ## Tool Use\n\
-             Tools available: {tool_list}\n\
-             - file_write: if the target already exists OR is a system path (/etc, /usr, /bin, /sbin, /boot, /lib, /sys, /proc), ask the user for confirmation first, then retry with force=true.\n\
-             - shell_exec: ask before destructive commands (rm, rmdir, dd, mkfs, etc.). Use background=true for EVERYTHING except trivial read-only commands that finish in <5 seconds (ls, cat, grep, ps, df, date, etc.). When in doubt, background=true. NEVER re-run a command that already appears in a [Tools called this turn] block from a previous turn — it is already running or completed.\n\
-             - memory_store: create a new memory. Use whenever the user asks you to remember something, or when you learn an important fact. Set pinned=true for explicit user requests.\n\
-             - memory_search: find memories by semantic query.\n\
-             - memory_update: correct or replace a memory's content; re-embeds automatically.\n\
-             - memory_delete: permanently remove a fully obsolete memory.\n\
-             - spawn_subagent: delegate a self-contained task to an isolated sub-agent.\n\
-             - schedule_task: create a background task that runs autonomously on a schedule (uses LLM). \
-The task runner has shell_exec, web_fetch, file_read, file_write, memory_search, and memory_store. \
-Use trigger_type='interval' (seconds), 'cron' (HH:MM UTC), or 'once' (RFC3339 timestamp). \
-Set max_idle_runs higher (e.g. 100) for long-wait monitoring — the runner uses 'still_waiting' \
-state to stay alive without wasting idle budget.\n\
-             - schedule_script_task: create a mechanical background task (NO LLM cost). \
-Runs a shell command and checks output against a regex pattern. Prefer this over schedule_task \
-when the task is just 'run a command and check the result'. Use {{output}} in message_template.\n\
-             - list_tasks: show all scheduled tasks with their status and next run time.\n\
-             - delete_task: cancel and remove a scheduled task by ID.\n\
-             - create_skill: define a named sub-agent profile with a custom system prompt and \
-tool set. Sub-agents always inherit the user's principal context automatically.\n\
-             - list_skills: show defined skills before creating new ones or spawning.\n\
-             - update_skill: modify a skill's prompt, description, or tools.\n\
-             - delete_skill: remove a skill by name.\n\
-             - spawn_subagent accepts an optional skill='name' parameter to use a skill profile.\n\
-             - code_symbols: list function/struct/class/table definitions in a file or directory \
-WITHOUT reading the full file contents. Use this FIRST to orient yourself in unfamiliar code — \
-it is much cheaper than file_read for understanding structure.\n\
-             - code_goto_definition: find where a symbol is defined. Give a file path, line, and column.\n\
-             - code_find_references: find every usage of a symbol across a project directory.\n\
-             - code_diagnostics: check a file for syntax errors (Rust, Python, SQL). For type-level \
-errors, use shell_exec with cargo check or ruff check.\n\
-             - When doing coding work, prefer code_symbols to scan structure before reading files. \
-Read only the specific sections you need, not entire files.\n\
-             - All other operations: proceed without asking.\n\
-             - IMPORTANT: After using tools, your final response MUST describe what you did and include the relevant output. This is the only record that persists across conversations."
+             {tool_section}"
         )
     }
 
@@ -844,28 +845,50 @@ mod tests {
         assert!(ctx.compaction_needed());
     }
 
-    /// Verify tool guidelines appear in the system prompt.
-    #[tokio::test]
-    async fn test_system_prompt_contains_tool_guidelines() {
-        let soul = Arc::new(RwLock::new(test_soul()));
-        let prompt = {
-            let s = soul.read().await;
-            let base = s.to_system_prompt();
-            let memory_section = MemoryManager::format_memories_for_prompt(&[]);
-            format!(
-                "{base}\n\n{memory_section}\n\nUse the retrieved memories above to provide personalized, contextual responses. Reference past conversations naturally when relevant, but don't force it.\n\n## Tool Use\nTools available: shell_exec, file_read, file_write, web_fetch, memory_search, memory_update, memory_delete, spawn_subagent, schedule_task, list_tasks, delete_task."
-            )
-        };
+    /// Verify tool guidelines appear in the system prompt, generated dynamically
+    /// from live ToolDefinitions via tools_to_prompt_section.
+    #[test]
+    fn test_system_prompt_contains_tool_guidelines() {
+        use crate::claude::ToolDefinition;
+        use crate::tools::tools_to_prompt_section;
+
+        // Build a small set of representative ToolDefinitions — mirrors what the
+        // real executor returns so the test doesn't depend on a live executor.
+        let defs: Vec<ToolDefinition> = vec![
+            ToolDefinition { name: "shell_exec",   description: "Execute a shell command.", input_schema: serde_json::json!({}) },
+            ToolDefinition { name: "file_write",   description: "Write content to a file.", input_schema: serde_json::json!({}) },
+            ToolDefinition { name: "memory_store", description: "Store a memory.",          input_schema: serde_json::json!({}) },
+            ToolDefinition { name: "memory_search",description: "Search memories.",         input_schema: serde_json::json!({}) },
+            ToolDefinition { name: "memory_update",description: "Update a memory.",         input_schema: serde_json::json!({}) },
+            ToolDefinition { name: "memory_delete",description: "Delete a memory.",         input_schema: serde_json::json!({}) },
+            ToolDefinition { name: "spawn_subagent",description: "Delegate a task.",        input_schema: serde_json::json!({}) },
+            ToolDefinition { name: "schedule_task", description: "Schedule a task.",        input_schema: serde_json::json!({}) },
+            ToolDefinition { name: "list_tasks",    description: "List tasks.",             input_schema: serde_json::json!({}) },
+            ToolDefinition { name: "delete_task",   description: "Delete a task.",          input_schema: serde_json::json!({}) },
+        ];
+
+        let section = tools_to_prompt_section(&defs);
+        // The section must contain the "Tools available:" line and per-tool bullets.
+        assert!(section.contains("Tools available:"), "missing Tools available line");
+        assert!(section.contains("shell_exec"),    "missing shell_exec");
+        assert!(section.contains("file_write"),    "missing file_write");
+        assert!(section.contains("memory_search"), "missing memory_search");
+        assert!(section.contains("memory_update"), "missing memory_update");
+        assert!(section.contains("memory_delete"), "missing memory_delete");
+        assert!(section.contains("schedule_task"), "missing schedule_task");
+        assert!(section.contains("list_tasks"),    "missing list_tasks");
+        assert!(section.contains("delete_task"),   "missing delete_task");
+        assert!(section.contains("spawn_subagent"),"missing spawn_subagent");
+
+        // Verify the full prompt carries the ## Tool Use header and the dynamic section.
+        let soul = test_soul();
+        let base = soul.to_system_prompt();
+        let memory_section = MemoryManager::format_memories_for_prompt(&[]);
+        let prompt = format!(
+            "{base}\n{memory_section}\n\n## Tool Use\n{section}"
+        );
         assert!(prompt.contains("## Tool Use"));
         assert!(prompt.contains("shell_exec"));
-        assert!(prompt.contains("file_write"));
-        assert!(prompt.contains("memory_search"));
-        assert!(prompt.contains("memory_update"));
-        assert!(prompt.contains("memory_delete"));
-        assert!(prompt.contains("schedule_task"));
-        assert!(prompt.contains("list_tasks"));
-        assert!(prompt.contains("delete_task"));
-        assert!(prompt.contains("spawn_subagent"));
     }
 
     #[test]

@@ -452,6 +452,8 @@ impl CodeIndex {
     }
 
     /// Parse a file and return syntax diagnostics.
+    /// Uses enhanced language-specific parsers where available, with
+    /// tree-sitter as a fallback.
     pub fn diagnostics(&self, path: &Path) -> Vec<Diagnostic> {
         let lang = match Lang::from_path(path) {
             Some(l) => l,
@@ -462,23 +464,10 @@ impl CodeIndex {
                 message: "unsupported file type".to_string(),
             }],
         };
-        let source = match std::fs::read(path) {
-            Ok(s) => s,
-            Err(e) => return vec![Diagnostic {
-                file: path.to_path_buf(),
-                line: 0,
-                column: 0,
-                message: format!("cannot read file: {e}"),
-            }],
-        };
-        match parse_source(lang, &source) {
-            Some(tree) => collect_errors(&tree, &source, path),
-            None => vec![Diagnostic {
-                file: path.to_path_buf(),
-                line: 0,
-                column: 0,
-                message: "failed to parse".to_string(),
-            }],
+        match lang {
+            Lang::Rust => rust_diagnostics_enhanced(path),
+            Lang::Python => python_diagnostics_enhanced(path),
+            Lang::Sql => sql_diagnostics_enhanced(path),
         }
     }
 }
@@ -504,6 +493,168 @@ fn find_project_root(path: &Path) -> PathBuf {
         match dir.parent() {
             Some(parent) if parent != dir => dir = parent,
             _ => return dir.to_path_buf(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Enhanced diagnostics
+// ---------------------------------------------------------------------------
+
+/// Convert a byte offset into (line, column), both 1-based, by scanning the
+/// source text.  Returns (1, 1) if the offset is out of range.
+fn offset_to_line_col(src: &str, byte_offset: usize) -> (usize, usize) {
+    let safe_offset = byte_offset.min(src.len());
+    let before = &src[..safe_offset];
+    let line = before.bytes().filter(|&b| b == b'\n').count() + 1;
+    let col = before
+        .rfind('\n')
+        .map(|nl| safe_offset - nl - 1 + 1)
+        .unwrap_or(safe_offset + 1);
+    (line, col)
+}
+
+/// Inner implementation for Rust enhanced diagnostics using `ra_ap_syntax`.
+/// Returns `Err` on any I/O or parser-setup failure so the caller can fall back.
+fn try_rust_diagnostics(path: &Path) -> Result<Vec<Diagnostic>, Box<dyn std::error::Error>> {
+    use ra_ap_syntax::{Edition, SourceFile};
+
+    let src = std::fs::read_to_string(path)?;
+    let parsed = SourceFile::parse(&src, Edition::CURRENT);
+    let diags = parsed
+        .errors()
+        .iter()
+        .map(|e| {
+            // e.range() → TextRange; start offset as u32
+            let start: u32 = e.range().start().into();
+            let (line, col) = offset_to_line_col(&src, start as usize);
+            Diagnostic {
+                file: path.to_path_buf(),
+                line,
+                column: col.saturating_sub(1), // convert to 0-based column
+                message: e.to_string(),
+            }
+        })
+        .collect();
+    Ok(diags)
+}
+
+/// Rust diagnostics using `ra_ap_syntax` (richer than tree-sitter).
+/// Falls back to tree-sitter diagnostics on any error.
+pub fn rust_diagnostics_enhanced(path: &Path) -> Vec<Diagnostic> {
+    match try_rust_diagnostics(path) {
+        Ok(diags) => diags,
+        Err(_) => {
+            let source = std::fs::read(path).unwrap_or_default();
+            match parse_source(Lang::Rust, &source) {
+                Some(tree) => collect_errors(&tree, &source, path),
+                None => vec![],
+            }
+        }
+    }
+}
+
+/// Inner implementation for Python enhanced diagnostics using
+/// `rustpython-parser`.
+fn try_python_diagnostics(path: &Path) -> Result<Vec<Diagnostic>, Box<dyn std::error::Error>> {
+    use rustpython_parser::{parse, Mode};
+
+    let src = std::fs::read_to_string(path)?;
+    let path_str = path.to_string_lossy();
+    match parse(&src, Mode::Module, &path_str) {
+        Ok(_) => Ok(vec![]),
+        Err(e) => {
+            // e.offset is a TextSize (byte offset into the source).
+            let byte_off = u32::from(e.offset) as usize;
+            let (line, col) = offset_to_line_col(&src, byte_off);
+            Ok(vec![Diagnostic {
+                file: path.to_path_buf(),
+                line,
+                column: col.saturating_sub(1),
+                message: e.error.to_string(),
+            }])
+        }
+    }
+}
+
+/// Python diagnostics using `rustpython-parser`.
+/// Falls back to tree-sitter on any error.
+pub fn python_diagnostics_enhanced(path: &Path) -> Vec<Diagnostic> {
+    match try_python_diagnostics(path) {
+        Ok(diags) => diags,
+        Err(_) => {
+            let source = std::fs::read(path).unwrap_or_default();
+            match parse_source(Lang::Python, &source) {
+                Some(tree) => collect_errors(&tree, &source, path),
+                None => vec![],
+            }
+        }
+    }
+}
+
+/// Inner implementation for SQL diagnostics using `sqlparser` (parse errors)
+/// and `sqruff-lib` (lint violations).
+fn try_sql_diagnostics(path: &Path) -> Result<Vec<Diagnostic>, Box<dyn std::error::Error>> {
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser as SqlParser;
+    use sqruff_lib::core::config::FluffConfig;
+    use sqruff_lib::core::linter::core::Linter;
+
+    let src = std::fs::read_to_string(path)?;
+    let mut diags: Vec<Diagnostic> = Vec::new();
+
+    // --- sqlparser: catch hard parse errors ---
+    let dialect = GenericDialect {};
+    if let Err(e) = SqlParser::new(&dialect)
+        .try_with_sql(&src)
+        .and_then(|mut p| p.parse_statements())
+    {
+        // sqlparser doesn't give a position, so we report line 1.
+        diags.push(Diagnostic {
+            file: path.to_path_buf(),
+            line: 1,
+            column: 0,
+            message: format!("SQL parse error: {e}"),
+        });
+        // Still run sqruff below for any additional context.
+    }
+
+    // --- sqruff-lib: richer lint violations ---
+    let config = FluffConfig::default();
+    match Linter::new(config, None, None, true) {
+        Ok(linter) => {
+            let fname = path.to_string_lossy().into_owned();
+            match linter.lint_string(&src, Some(fname), false) {
+                Ok(linted) => {
+                    for v in linted.violations() {
+                        diags.push(Diagnostic {
+                            file: path.to_path_buf(),
+                            line: v.line_no,
+                            column: v.line_pos.saturating_sub(1),
+                            message: v.description.clone(),
+                        });
+                    }
+                }
+                Err(_) => { /* sqruff lint failed; sqlparser results still usable */ }
+            }
+        }
+        Err(_) => { /* sqruff config failed; sqlparser results still usable */ }
+    }
+
+    Ok(diags)
+}
+
+/// SQL diagnostics using `sqlparser` (parse errors) + `sqruff-lib` (lint).
+/// Falls back to tree-sitter on any error.
+pub fn sql_diagnostics_enhanced(path: &Path) -> Vec<Diagnostic> {
+    match try_sql_diagnostics(path) {
+        Ok(diags) => diags,
+        Err(_) => {
+            let source = std::fs::read(path).unwrap_or_default();
+            match parse_source(Lang::Sql, &source) {
+                Some(tree) => collect_errors(&tree, &source, path),
+                None => vec![],
+            }
         }
     }
 }
@@ -580,5 +731,65 @@ mod tests {
         );
         // Should find "foo" in the definition and in the call.
         assert!(refs.len() >= 2);
+    }
+
+    #[test]
+    fn test_offset_to_line_col() {
+        let src = "fn main() {\n    let x = 1;\n}";
+        // Offset 0 → line 1, col 1
+        assert_eq!(offset_to_line_col(src, 0), (1, 1));
+        // First char of line 2 (after the '\n' at offset 11)
+        assert_eq!(offset_to_line_col(src, 12), (2, 1));
+    }
+
+    #[test]
+    fn test_rust_enhanced_valid() {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(f, "fn hello() {{ }}").unwrap();
+        let diags = rust_diagnostics_enhanced(f.path());
+        assert!(diags.is_empty(), "valid Rust should have no diagnostics: {:?}", diags);
+    }
+
+    #[test]
+    fn test_rust_enhanced_invalid() {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(f, "fn broken( {{ }}").unwrap();
+        let diags = rust_diagnostics_enhanced(f.path());
+        assert!(!diags.is_empty(), "broken Rust should produce diagnostics");
+    }
+
+    #[test]
+    fn test_python_enhanced_valid() {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.as_file_mut()
+            .write_all(b"def foo():\n    pass\n")
+            .unwrap();
+        // Rename to .py so Lang::from_path works (not needed here since we
+        // call the function directly).
+        let diags = python_diagnostics_enhanced(f.path());
+        assert!(diags.is_empty(), "valid Python should have no diagnostics: {:?}", diags);
+    }
+
+    #[test]
+    fn test_python_enhanced_invalid() {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.as_file_mut().write_all(b"def foo(\n").unwrap();
+        let diags = python_diagnostics_enhanced(f.path());
+        assert!(!diags.is_empty(), "broken Python should produce diagnostics");
+    }
+
+    #[test]
+    fn test_sql_enhanced_valid() {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(f, "SELECT 1;").unwrap();
+        // Valid SQL — sqlparser should not error; sqruff may or may not warn.
+        let diags = sql_diagnostics_enhanced(f.path());
+        // Just check it runs without panic.
+        let _ = diags;
     }
 }

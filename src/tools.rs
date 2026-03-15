@@ -740,6 +740,32 @@ fn format_tool_result(result: &str) -> String {
     format!("  ↳ {}\n\n", trunc(first, 80))
 }
 
+/// Generate the `## Tool Use` section of the system prompt dynamically from live tool definitions.
+///
+/// Returns a string like:
+/// ```text
+/// Tools available: tool1, tool2, tool3.
+/// - tool1: description...
+/// - tool2: description...
+/// ```
+pub fn tools_to_prompt_section(defs: &[ToolDefinition]) -> String {
+    let names: Vec<&str> = defs.iter().map(|d| d.name).collect();
+    let tool_list = names.join(", ");
+    let bullets: String = defs
+        .iter()
+        .map(|d| {
+            // Use only the first line/sentence of the description to keep things concise.
+            let short_desc = d.description
+                .split("\n\n")
+                .next()
+                .unwrap_or(d.description)
+                .trim();
+            format!("- {}: {}\n", d.name, short_desc)
+        })
+        .collect();
+    format!("Tools available: {tool_list}.\n{bullets}")
+}
+
 // ---------------------------------------------------------------------------
 
 /// Configuration for constructing a `ToolExecutor`.

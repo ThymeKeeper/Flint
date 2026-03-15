@@ -48,6 +48,11 @@ tree-sitter = "0.26"
 tree-sitter-rust = "0.24"
 tree-sitter-python = "0.25"
 tree-sitter-sequel = "0.3"
+ra_ap_syntax = "0.0.323"
+rustpython-parser = "0.4.0"
+sqlparser = "0.61.0"
+sqruff-lib = "0.35.4"
+sqruff-lib-core = "0.35.4"
 
 [build-dependencies]
 ureq = "2"
