@@ -12,6 +12,7 @@ use crate::memory::{MemoryKind, MemoryManager, MemoryRef};
 use crate::observer::AgentObserver;
 use crate::skills::SkillManager;
 use crate::tasks::TaskManager;
+use crate::code_intel::CodeIndex;
 use crate::tools::{self, ToolExecutorConfig};
 
 // ---------------------------------------------------------------------------
@@ -33,6 +34,8 @@ pub struct Agent {
     /// The Signal channel client (if configured). Used by the `signal_send` tool
     /// so the agent can proactively send Signal messages to the primary contact.
     pub signal_client: Option<Arc<dyn crate::signal::SignalClient>>,
+    /// Shared tree-sitter code intelligence index.
+    pub code_index: Arc<CodeIndex>,
 }
 
 impl Agent {
@@ -50,6 +53,7 @@ impl Agent {
         config: AppConfig,
         history: Vec<StoredTurn>,
         signal_client: Option<Arc<dyn crate::signal::SignalClient>>,
+        code_index: Arc<CodeIndex>,
     ) -> Self {
         let mut context = ConversationContext::new(config.claude.clone());
         for turn in &history {
@@ -64,7 +68,7 @@ impl Agent {
             };
             context.push(role, content);
         }
-        Self { soul, llm, utility_llm, memory, tasks, skills, jobs, conv_store, context: RwLock::new(context), config, signal_client }
+        Self { soul, llm, utility_llm, memory, tasks, skills, jobs, conv_store, context: RwLock::new(context), config, signal_client, code_index }
     }
 
     /// Handle an incoming message: retrieve memories, generate response, store memories.
@@ -131,6 +135,7 @@ impl Agent {
             soul_context,
             is_signal_reply: channel == "signal",
             observer:        observer.clone(),
+            code_index:      self.code_index.clone(),
         });
         let mut messages = {
             let ctx = self.context.read().await;
@@ -151,8 +156,24 @@ impl Agent {
                     self.llm.complete_with_tools_streaming(req, cb).await
                 }
                 None => self.llm.complete_with_tools(req).await,
-            }
-            .context("Claude completion failed")?;
+            };
+
+            // Handle "prompt is too long" errors by truncating the last tool
+            // result and retrying, rather than surfacing the error to the user.
+            let resp = match resp {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    if msg.contains("prompt is too long") {
+                        warn!("Prompt too long — truncating last tool result and retrying");
+                        truncate_last_tool_result(&mut messages);
+                        // Compact the persistent context as well.
+                        self.compact_context_if_needed().await.ok();
+                        continue;
+                    }
+                    return Err(e).context("Claude completion failed");
+                }
+            };
 
             if resp.tool_calls.is_empty() {
                 break resp.text;
@@ -295,11 +316,13 @@ impl Agent {
         let tool_list = if self.config.signal.is_some() && channel != "signal" {
             "shell_exec, file_read, file_write, web_fetch, memory_store, memory_search, \
              memory_update, memory_delete, spawn_subagent, schedule_task, schedule_script_task, \
-             list_tasks, delete_task, create_skill, list_skills, update_skill, delete_skill, signal_send."
+             list_tasks, delete_task, create_skill, list_skills, update_skill, delete_skill, signal_send, \
+             code_symbols, code_goto_definition, code_find_references, code_diagnostics."
         } else {
             "shell_exec, file_read, file_write, web_fetch, memory_store, memory_search, \
              memory_update, memory_delete, spawn_subagent, schedule_task, schedule_script_task, \
-             list_tasks, delete_task, create_skill, list_skills, update_skill, delete_skill."
+             list_tasks, delete_task, create_skill, list_skills, update_skill, delete_skill, \
+             code_symbols, code_goto_definition, code_find_references, code_diagnostics."
         };
 
         format!(
@@ -332,6 +355,15 @@ tool set. Sub-agents always inherit the user's principal context automatically.\
              - update_skill: modify a skill's prompt, description, or tools.\n\
              - delete_skill: remove a skill by name.\n\
              - spawn_subagent accepts an optional skill='name' parameter to use a skill profile.\n\
+             - code_symbols: list function/struct/class/table definitions in a file or directory \
+WITHOUT reading the full file contents. Use this FIRST to orient yourself in unfamiliar code — \
+it is much cheaper than file_read for understanding structure.\n\
+             - code_goto_definition: find where a symbol is defined. Give a file path, line, and column.\n\
+             - code_find_references: find every usage of a symbol across a project directory.\n\
+             - code_diagnostics: check a file for syntax errors (Rust, Python, SQL). For type-level \
+errors, use shell_exec with cargo check or ruff check.\n\
+             - When doing coding work, prefer code_symbols to scan structure before reading files. \
+Read only the specific sections you need, not entire files.\n\
              - All other operations: proceed without asking.\n\
              - IMPORTANT: After using tools, your final response MUST describe what you did and include the relevant output. This is the only record that persists across conversations."
         )
@@ -626,6 +658,40 @@ async fn consolidate_memories(memory: &MemoryManager, llm: &Arc<dyn LlmClient>) 
         }
     }
     Ok(())
+}
+
+/// When the prompt exceeds the model's context limit, find the largest tool
+/// result in the local `messages` vec and truncate it so the retry fits.
+fn truncate_last_tool_result(messages: &mut [ApiMessage]) {
+    // Cap each tool result at roughly 20k chars (~5k tokens).
+    const MAX_RESULT_CHARS: usize = 20_000;
+
+    // Walk backwards to find the most recent user message with tool results.
+    for msg in messages.iter_mut().rev() {
+        if let MessageContent::Blocks(ref mut blocks) = msg.content {
+            let mut truncated_any = false;
+            for block in blocks.iter_mut() {
+                if let ContentBlock::ToolResult { content, .. } = block {
+                    if content.len() > MAX_RESULT_CHARS {
+                        let note = format!(
+                            "\n[TRUNCATED: output was {} chars, only the first {} are shown. \
+                             The full content was too large for the context window. \
+                             If you need more of this content, request a specific portion \
+                             (e.g. a line range or section) rather than the whole thing.]",
+                            content.len(),
+                            MAX_RESULT_CHARS
+                        );
+                        content.truncate(MAX_RESULT_CHARS);
+                        content.push_str(&note);
+                        truncated_any = true;
+                    }
+                }
+            }
+            if truncated_any {
+                return;
+            }
+        }
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {

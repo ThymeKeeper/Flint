@@ -75,8 +75,9 @@ async fn build_agent(llm_responses: Vec<String>) -> Arc<Agent> {
     let utility_llm = Arc::new(MockLlm::new(vec![
         "[]".to_string(), "[]".to_string(), "[]".to_string(), "[]".to_string(),
     ]));
+    let code_index = Arc::new(flint::code_intel::CodeIndex::new());
     Arc::new(Agent::new(
-        soul, llm, utility_llm, memory, tasks, skills, jobs, conv_store, config, vec![], None,
+        soul, llm, utility_llm, memory, tasks, skills, jobs, conv_store, config, vec![], None, code_index,
     ))
 }
 

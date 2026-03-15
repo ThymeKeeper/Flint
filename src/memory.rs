@@ -97,6 +97,10 @@ pub struct MemoryManager {
 impl MemoryManager {
     /// Open (or create) the DuckDB database and ensure the schema exists.
     /// Pass `db_path = Path::new(":memory:")` for an in-memory database (tests).
+    ///
+    /// On startup, compares the current embedding model's fingerprint against
+    /// the one stored in the database. If they differ (model was swapped),
+    /// all memory embeddings are regenerated in a batch before returning.
     pub async fn new(
         db_path: &Path,
         embedder: Arc<dyn EmbeddingClient>,
@@ -127,18 +131,124 @@ impl MemoryManager {
         conn.execute_batch(ddl)
             .context("Failed to create memories table")?;
 
+        // Metadata table for tracking the embedding model fingerprint.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS memory_meta (
+                key   VARCHAR PRIMARY KEY,
+                value VARCHAR NOT NULL
+            )",
+        )
+        .context("Failed to create memory_meta table")?;
+
         info!(
             "Memory database ready at {} (dim={})",
             db_path.display(),
             embedding_dim
         );
 
-        Ok(Self {
+        let mgr = Self {
             db: Arc::new(Mutex::new(conn)),
             embedder,
             config,
             embedding_dim,
-        })
+        };
+
+        mgr.reindex_if_model_changed().await?;
+
+        Ok(mgr)
+    }
+
+    /// Compare the current embedding model fingerprint against the one stored
+    /// in the database. If they differ, re-embed every memory's content.
+    async fn reindex_if_model_changed(&self) -> Result<()> {
+        let current_fingerprint = self.embedder.model_fingerprint();
+        let db = self.db.clone();
+
+        let stored_fingerprint: Option<String> = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT value FROM memory_meta WHERE key = 'embedding_model_fingerprint'",
+                [],
+                |row| row.get(0),
+            )
+            .ok()
+        };
+
+        if stored_fingerprint.as_deref() == Some(&current_fingerprint) {
+            return Ok(());
+        }
+
+        // Count memories that actually need re-embedding.
+        let count: usize = {
+            let conn = db.lock().unwrap();
+            conn.query_row("SELECT COUNT(*) FROM memories", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap_or(0) as usize
+        };
+
+        if count == 0 {
+            // No memories to re-embed — just store the fingerprint.
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO memory_meta (key, value) VALUES ('embedding_model_fingerprint', ?)",
+                duckdb::params![current_fingerprint],
+            )
+            .context("Failed to store embedding fingerprint")?;
+            return Ok(());
+        }
+
+        if stored_fingerprint.is_some() {
+            info!(
+                "Embedding model changed — re-indexing {} memories",
+                count
+            );
+        } else {
+            info!(
+                "No embedding fingerprint on record — indexing {} memories",
+                count
+            );
+        }
+
+        // Load all (id, content) pairs.
+        let rows: Vec<(String, String)> = {
+            let conn = db.lock().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT id, content FROM memories")
+                .context("prepare reindex query failed")?;
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .context("query_map reindex failed")?
+                .collect::<duckdb::Result<Vec<_>>>()
+                .context("collect reindex failed")?
+        };
+
+        // Batch embed all content.
+        let texts: Vec<String> = rows.iter().map(|(_, c)| c.clone()).collect();
+        let embeddings = self.embedder.embed_batch(&texts).await?;
+
+        // Write new embeddings back to the database.
+        {
+            let conn = self.db.lock().unwrap();
+            for ((id, _), emb) in rows.iter().zip(embeddings.iter()) {
+                let emb_json = serde_json::to_string(emb)
+                    .context("Failed to serialize embedding during reindex")?;
+                conn.execute(
+                    "UPDATE memories SET embedding = ? WHERE id = ?",
+                    duckdb::params![emb_json, id],
+                )
+                .context("reindex update failed")?;
+            }
+
+            // Store the new fingerprint.
+            conn.execute(
+                "INSERT OR REPLACE INTO memory_meta (key, value) VALUES ('embedding_model_fingerprint', ?)",
+                duckdb::params![current_fingerprint],
+            )
+            .context("Failed to store embedding fingerprint")?;
+        }
+
+        info!("Re-indexing complete: {} memories updated", rows.len());
+        Ok(())
     }
 
     /// Expose the underlying DuckDB connection so other managers (e.g. TaskManager)

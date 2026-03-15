@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use fastembed::{InitOptionsUserDefined, TextEmbedding, TokenizerFiles, UserDefinedEmbeddingModel};
+use sha2::{Digest, Sha256};
 use std::sync::Mutex;
 use tracing::debug;
 
@@ -15,6 +16,9 @@ pub const EMBEDDING_DIM: usize = 384;
 pub trait EmbeddingClient: Send + Sync {
     async fn embed(&self, text: &str) -> Result<Vec<f32>>;
     async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
+    /// A fingerprint that uniquely identifies the embedding model.
+    /// If this changes between runs, all stored embeddings must be regenerated.
+    fn model_fingerprint(&self) -> String;
 }
 
 // ---------------------------------------------------------------------------
@@ -25,6 +29,8 @@ pub trait EmbeddingClient: Send + Sync {
 /// Model bytes are compiled into the binary at build time via `include_bytes!`.
 pub struct LocalEmbeddingClient {
     model: Mutex<TextEmbedding>,
+    /// SHA-256 hex digest of model.onnx — changes when the model file changes.
+    fingerprint: String,
 }
 
 impl LocalEmbeddingClient {
@@ -47,8 +53,11 @@ impl LocalEmbeddingClient {
             })
         };
 
+        let model_bytes = read("model.onnx")?;
+        let fingerprint = format!("{:x}", Sha256::digest(&model_bytes));
+
         let user_model = UserDefinedEmbeddingModel::new(
-            read("model.onnx")?,
+            model_bytes,
             TokenizerFiles {
                 tokenizer_file: read("tokenizer.json")?,
                 config_file: read("config.json")?,
@@ -63,6 +72,7 @@ impl LocalEmbeddingClient {
 
         Ok(Self {
             model: Mutex::new(embedding),
+            fingerprint,
         })
     }
 }
@@ -87,6 +97,10 @@ impl EmbeddingClient for LocalEmbeddingClient {
             .unwrap()
             .embed(texts.to_vec(), None)
             .context("Local batch embedding failed")
+    }
+
+    fn model_fingerprint(&self) -> String {
+        self.fingerprint.clone()
     }
 }
 
@@ -161,6 +175,10 @@ pub mod mock {
         async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
             self.call_count.fetch_add(1, Ordering::Relaxed);
             Ok(texts.iter().map(|t| self.text_to_embedding(t)).collect())
+        }
+
+        fn model_fingerprint(&self) -> String {
+            "mock-embedding-model".to_string()
         }
     }
 }

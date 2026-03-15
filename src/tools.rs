@@ -7,6 +7,7 @@ use tokio::time::timeout;
 use crate::claude::{
     ApiMessage, ClaudeRequest, ContentBlock, LlmClient, MessageContent, ToolDefinition,
 };
+use crate::code_intel::CodeIndex;
 use crate::jobs::BackgroundJobStore;
 use crate::memory::MemoryManager;
 use crate::observer::AgentObserver;
@@ -592,6 +593,92 @@ fn signal_send_definition() -> ToolDefinition {
     }
 }
 
+fn code_intel_tool_definitions() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: "code_symbols",
+            description: "List symbol definitions (functions, structs, classes, tables, etc.) \
+                in a file or directory. Much cheaper than reading entire files — use this to \
+                orient yourself in a codebase before reading specific sections. \
+                Supports Rust, Python, and SQL files.",
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File or directory path to scan for symbols"
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Optional filter — only return symbols whose name contains this string (case-insensitive)"
+                    }
+                },
+                "required": ["path"]
+            }),
+        },
+        ToolDefinition {
+            name: "code_goto_definition",
+            description: "Find the definition of the symbol at a given file position. \
+                Returns the file, line, and a preview of the definition. \
+                Searches the current file first, then the project workspace.",
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the file containing the symbol reference"
+                    },
+                    "line": {
+                        "type": "integer",
+                        "description": "Line number (1-based)"
+                    },
+                    "column": {
+                        "type": "integer",
+                        "description": "Column number (0-based)"
+                    }
+                },
+                "required": ["path", "line", "column"]
+            }),
+        },
+        ToolDefinition {
+            name: "code_find_references",
+            description: "Find all references to a symbol across a project directory. \
+                Returns every location where the identifier appears. \
+                Useful for understanding impact before refactoring.",
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "symbol": {
+                        "type": "string",
+                        "description": "The symbol name to search for"
+                    },
+                    "directory": {
+                        "type": "string",
+                        "description": "Project directory to search in"
+                    }
+                },
+                "required": ["symbol", "directory"]
+            }),
+        },
+        ToolDefinition {
+            name: "code_diagnostics",
+            description: "Check a file for syntax errors. Returns structured diagnostics \
+                with file, line, column, and error message. For deeper analysis (type errors, \
+                lint), use shell_exec with cargo check or ruff.",
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the file to check"
+                    }
+                },
+                "required": ["path"]
+            }),
+        },
+    ]
+}
+
 // ---------------------------------------------------------------------------
 // Tool-event formatting helpers
 // ---------------------------------------------------------------------------
@@ -631,6 +718,10 @@ fn format_tool_call(name: &str, input: &Value) -> String {
         "update_skill"   => input["id"].as_str().unwrap_or("").to_string(),
         "delete_skill"   => input["id"].as_str().unwrap_or("").to_string(),
         "signal_send"    => trunc(input["message"].as_str().unwrap_or(""), 60),
+        "code_symbols"         => input["path"].as_str().unwrap_or("").to_string(),
+        "code_goto_definition" => format!("{}:{}:{}", input["path"].as_str().unwrap_or(""), input["line"], input["column"]),
+        "code_find_references" => format!("{} in {}", input["symbol"].as_str().unwrap_or(""), input["directory"].as_str().unwrap_or("")),
+        "code_diagnostics"     => input["path"].as_str().unwrap_or("").to_string(),
         _                => trunc(&input.to_string(), 72),
     };
     if detail.is_empty() {
@@ -665,6 +756,7 @@ pub struct ToolExecutorConfig {
     pub soul_context:    String,
     pub is_signal_reply: bool,
     pub observer:        Option<Arc<dyn AgentObserver>>,
+    pub code_index:      Arc<CodeIndex>,
 }
 
 pub struct ToolExecutor {
@@ -686,6 +778,8 @@ pub struct ToolExecutor {
     /// signal_send is suppressed in this case — replies are delivered automatically
     /// and offering the tool would cause duplicate messages.
     is_signal_reply: bool,
+    /// Tree-sitter code intelligence index.
+    code_index:     Arc<CodeIndex>,
 }
 
 impl ToolExecutor {
@@ -704,6 +798,7 @@ impl ToolExecutor {
             signal_client:   cfg.signal_client,
             primary_contact: cfg.primary_contact,
             is_signal_reply: cfg.is_signal_reply,
+            code_index:      cfg.code_index,
         }
     }
 
@@ -712,6 +807,7 @@ impl ToolExecutor {
         llm: Arc<dyn LlmClient>,
         memory: Arc<MemoryManager>,
         max_tokens: usize,
+        code_index: Arc<CodeIndex>,
     ) -> Self {
         Self {
             llm,
@@ -725,6 +821,7 @@ impl ToolExecutor {
             signal_client: None,
             primary_contact: String::new(),
             is_signal_reply: false,
+            code_index,
         }
     }
 
@@ -742,6 +839,7 @@ impl ToolExecutor {
         if self.signal_client.is_some() && !self.is_signal_reply {
             defs.push(signal_send_definition());
         }
+        defs.extend(code_intel_tool_definitions());
         defs
     }
 
@@ -794,6 +892,10 @@ impl ToolExecutor {
             "update_skill"   => self.update_skill(input).await,
             "delete_skill"   => self.delete_skill(input).await,
             "signal_send"    => self.signal_send(input).await,
+            "code_symbols"         => self.code_symbols(input),
+            "code_goto_definition" => self.code_goto_definition(input),
+            "code_find_references" => self.code_find_references(input),
+            "code_diagnostics"     => self.code_diagnostics(input),
             _ => execute_tool(name, input).await,
         };
         if let Some(obs) = &self.observer {
@@ -1245,6 +1347,107 @@ impl ToolExecutor {
             });
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Code intelligence tool implementations
+    // -----------------------------------------------------------------------
+
+    fn code_symbols(&self, input: &Value) -> String {
+        let path = match input["path"].as_str() {
+            Some(p) => std::path::PathBuf::from(p),
+            None => return "Error: missing 'path' field".to_string(),
+        };
+        let query = input["query"].as_str();
+        let symbols = self.code_index.symbols(&path, query);
+        if symbols.is_empty() {
+            return "No symbols found.".to_string();
+        }
+        let entries: Vec<Value> = symbols
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "name": s.name,
+                    "kind": s.kind,
+                    "file": s.file.display().to_string(),
+                    "line": s.line,
+                    "end_line": s.end_line,
+                    "preview": s.preview,
+                })
+            })
+            .collect();
+        serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string())
+    }
+
+    fn code_goto_definition(&self, input: &Value) -> String {
+        let path = match input["path"].as_str() {
+            Some(p) => std::path::PathBuf::from(p),
+            None => return "Error: missing 'path' field".to_string(),
+        };
+        let line = input["line"].as_u64().unwrap_or(1) as usize;
+        let column = input["column"].as_u64().unwrap_or(0) as usize;
+        match self.code_index.goto_definition(&path, line, column) {
+            Some(sym) => serde_json::json!({
+                "name": sym.name,
+                "kind": sym.kind,
+                "file": sym.file.display().to_string(),
+                "line": sym.line,
+                "end_line": sym.end_line,
+                "preview": sym.preview,
+            })
+            .to_string(),
+            None => "No definition found.".to_string(),
+        }
+    }
+
+    fn code_find_references(&self, input: &Value) -> String {
+        let symbol = match input["symbol"].as_str() {
+            Some(s) => s,
+            None => return "Error: missing 'symbol' field".to_string(),
+        };
+        let directory = match input["directory"].as_str() {
+            Some(d) => std::path::PathBuf::from(d),
+            None => return "Error: missing 'directory' field".to_string(),
+        };
+        let refs = self.code_index.find_references(symbol, &directory);
+        if refs.is_empty() {
+            return "No references found.".to_string();
+        }
+        let entries: Vec<Value> = refs
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "file": r.file.display().to_string(),
+                    "line": r.line,
+                    "column": r.column,
+                    "preview": r.preview,
+                })
+            })
+            .collect();
+        serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string())
+    }
+
+    fn code_diagnostics(&self, input: &Value) -> String {
+        let path = match input["path"].as_str() {
+            Some(p) => std::path::PathBuf::from(p),
+            None => return "Error: missing 'path' field".to_string(),
+        };
+        let diags = self.code_index.diagnostics(&path);
+        if diags.is_empty() {
+            return "No syntax errors found.".to_string();
+        }
+        let entries: Vec<Value> = diags
+            .iter()
+            .map(|d| {
+                serde_json::json!({
+                    "file": d.file.display().to_string(),
+                    "line": d.line,
+                    "column": d.column,
+                    "message": d.message,
+                })
+            })
+            .collect();
+        serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1366,6 +1569,7 @@ mod tests {
             soul_context: String::new(),
             is_signal_reply: false,
             observer: None,
+            code_index: Arc::new(CodeIndex::new()),
         })
     }
 
@@ -1373,8 +1577,8 @@ mod tests {
     async fn test_executor_tool_definitions() {
         let executor = test_executor().await;
         let defs = executor.tool_definitions();
-        // 4 base + 4 memory + spawn_subagent + 4 task tools + 4 skill tools = 17 (no signal_send, signal_client is None)
-        assert_eq!(defs.len(), 17);
+        // 4 base + 4 memory + spawn_subagent + 4 task + 4 skill + 4 code_intel = 21 (no signal_send, signal_client is None)
+        assert_eq!(defs.len(), 21);
         let names: Vec<_> = defs.iter().map(|d| d.name).collect();
         assert!(names.contains(&"spawn_subagent"));
         assert!(names.contains(&"memory_store"));
@@ -1441,6 +1645,7 @@ mod tests {
             soul_context: String::new(),
             is_signal_reply: false,
             observer: None,
+            code_index: Arc::new(CodeIndex::new()),
         });
         let input = serde_json::json!({"task": "summarise /etc/hostname"});
         let result = executor.execute("spawn_subagent", &input).await;

@@ -52,6 +52,8 @@ pub enum AgentUpdate {
     /// Pre-populate the chat with persisted history on startup.
     /// Each entry is (display_role, content) e.g. ("You", "…") or ("Calcifer", "…").
     HistoryLoaded(Vec<(String, String)>),
+    /// Append new turns to the end of the chat (e.g. from Signal exchanges).
+    NewTurns(Vec<(String, String)>),
 }
 
 /// Channel endpoints owned by `TuiSignalClient`.
@@ -207,6 +209,19 @@ pub fn run_tui(
                     messages = history_msgs;
                     // Stay pinned to bottom so the most recent message is visible.
                     scroll_up = 0;
+                }
+                Ok(AgentUpdate::NewTurns(turns)) => {
+                    // Append new turns (e.g. from Signal) to the end of the chat.
+                    for (role, content) in turns {
+                        messages.push(ChatMessage {
+                            role,
+                            text: content,
+                            streaming: false,
+                        });
+                    }
+                    if auto_scroll {
+                        scroll_up = 0;
+                    }
                 }
                 Err(_) => break,
             }

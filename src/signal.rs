@@ -587,6 +587,13 @@ impl TuiSignalClient {
             .agent_update_tx
             .try_send(crate::tui::AgentUpdate::HistoryLoaded(turns));
     }
+
+    /// Append new turns to the end of the TUI chat (e.g. from Signal exchanges).
+    pub fn push_turns(&self, turns: Vec<(String, String)>) {
+        let _ = self
+            .agent_update_tx
+            .try_send(crate::tui::AgentUpdate::NewTurns(turns));
+    }
 }
 
 #[async_trait]

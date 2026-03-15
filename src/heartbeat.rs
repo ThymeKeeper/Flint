@@ -8,6 +8,7 @@ use crate::config::AppConfig;
 use crate::memory::MemoryManager;
 use crate::signal::SignalClient;
 use crate::tasks::{TaskEntry, TaskLifecycleEvent, TaskManager, TaskRunOutput, TaskRunState};
+use crate::code_intel::CodeIndex;
 use crate::tools::ToolExecutor;
 
 // ---------------------------------------------------------------------------
@@ -213,7 +214,8 @@ async fn execute_task(
     memory: &Arc<MemoryManager>,
     max_tokens: usize,
 ) -> Result<TaskRunOutput> {
-    let executor = ToolExecutor::for_task_runner(llm.clone(), memory.clone(), max_tokens);
+    let code_index = Arc::new(CodeIndex::new());
+    let executor = ToolExecutor::for_task_runner(llm.clone(), memory.clone(), max_tokens, code_index);
     let tool_defs = executor.task_runner_tool_definitions();
 
     let user_msg = format!(

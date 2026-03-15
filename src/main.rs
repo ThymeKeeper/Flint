@@ -21,12 +21,26 @@ use flint::tasks::TaskManager;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Write logs to a file instead of stderr so they don't corrupt the TUI.
+    let log_dir = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".flint");
+    std::fs::create_dir_all(&log_dir).ok();
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_dir.join("flint.log"))
+        .unwrap_or_else(|_| {
+            // Fall back to /dev/null if we can't open the log file.
+            std::fs::File::open("/dev/null").expect("cannot open /dev/null")
+        });
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
         )
-        .with_writer(std::io::stderr)
+        .with_writer(std::sync::Mutex::new(log_file))
         .init();
 
     info!("flint starting up");
@@ -204,6 +218,9 @@ async fn main() -> Result<()> {
         Arc::new(SignalTcpRpcClient::new(sc)) as Arc<dyn SignalClient>
     });
 
+    // ── Code intelligence (tree-sitter) ─────────────────────────────────────
+    let code_index = Arc::new(flint::code_intel::CodeIndex::new());
+
     // ── Agent ─────────────────────────────────────────────────────────────────
     let agent = Arc::new(Agent::new(
         soul.clone(),
@@ -217,6 +234,7 @@ async fn main() -> Result<()> {
         config.clone(),
         history,
         signal_rest.clone(),
+        code_index,
     ));
 
     info!("All components initialized — ready to chat");
@@ -285,7 +303,7 @@ async fn main() -> Result<()> {
                                 if let Some(r) = resp {
                                     let text = r.display_text();
                                     if !text.trim().is_empty() {
-                                        tui_client.push_history(vec![
+                                        tui_client.push_turns(vec![
                                             ("You".to_string(), msg.text.clone()),
                                             (agent.soul.read().await.name.clone(), text),
                                         ]);

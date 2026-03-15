@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod code_intel;
 pub mod claude;
 pub mod config;
 pub mod context;
