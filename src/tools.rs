@@ -578,8 +578,15 @@ fn signal_send_definition() -> ToolDefinition {
     ToolDefinition {
         name: "signal_send",
         description: "Send a proactive Signal message to the primary contact. \
-            Use for task completion notifications, reminders, alerts, or any message \
-            that should arrive on the user's phone unprompted. \
+            ONLY use this tool in these situations: \
+            (a) you are replying to a Signal message and want to send an extra notification, \
+            (b) a background task or scheduler triggered this turn and you have a result \
+                to report, or \
+            (c) the user explicitly asked you to notify them on Signal / send to their \
+                phone (e.g. 'send to signal', 'notify me on signal', 'message me on signal'). \
+            Do NOT call signal_send just because Signal is configured — only call it when \
+            one of the above conditions is met. Calling it during a plain TUI conversation \
+            without explicit user intent sends an unwanted duplicate to the user's phone. \
             Do NOT use shell_exec to invoke signal-cli directly; that will hang.",
         input_schema: serde_json::json!({
             "type": "object",
@@ -774,6 +781,32 @@ pub fn tools_to_prompt_section(defs: &[ToolDefinition]) -> String {
 
 // ---------------------------------------------------------------------------
 
+/// Returns `true` if the user's message text contains an explicit request to
+/// send a notification via Signal to their phone.
+///
+/// This gates the availability of the `signal_send` tool in TUI sessions:
+/// the tool is hidden unless the user has clearly expressed intent to use it,
+/// preventing the LLM from firing off phone notifications unprompted.
+pub fn user_requests_signal(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let phrases = [
+        "send to signal",
+        "send to my phone",
+        "notify me on signal",
+        "message me on signal",
+        "signal me",
+        "ping me on signal",
+        "send a signal",
+        "send via signal",
+        "via signal",
+        "on signal",
+        "text me on signal",
+        "send me a signal",
+        "drop me a signal",
+    ];
+    phrases.iter().any(|p| lower.contains(p))
+}
+
 /// Configuration for constructing a `ToolExecutor`.
 /// Using a struct avoids positional-parameter friction when adding new fields.
 pub struct ToolExecutorConfig {
@@ -786,8 +819,13 @@ pub struct ToolExecutorConfig {
     pub subagent_mgr:    Option<Arc<SubAgentManager>>,
     pub signal_client:   Option<Arc<dyn SignalClient>>,
     pub primary_contact: String,
+    /// The channel string for this turn (e.g. "tui", "signal", "task").
+    pub channel:         String,
     pub soul_context:    String,
     pub is_signal_reply: bool,
+    /// True when the TUI user message explicitly requests a Signal notification.
+    /// Detected by scanning the message text for intent phrases like "send to signal".
+    pub user_requested_signal: bool,
     pub observer:        Option<Arc<dyn AgentObserver>>,
     pub code_index:      Arc<CodeIndex>,
 }
@@ -809,10 +847,15 @@ pub struct ToolExecutor {
     signal_client:  Option<Arc<dyn SignalClient>>,
     /// Primary contact phone number (recipient for signal_send).
     primary_contact: String,
+    /// The channel string for this turn ("tui", "signal", "task", etc.).
+    channel: String,
     /// True when the current conversation arrived via Signal.
     /// signal_send is suppressed in this case — replies are delivered automatically
     /// and offering the tool would cause duplicate messages.
     is_signal_reply: bool,
+    /// True when the TUI user message explicitly requested a Signal notification.
+    /// Set by scanning the user message for intent phrases before building the tool list.
+    user_requested_signal: bool,
     /// Tree-sitter code intelligence index.
     code_index:     Arc<CodeIndex>,
 }
@@ -833,7 +876,9 @@ impl ToolExecutor {
             subagent_mgr:    cfg.subagent_mgr,
             signal_client:   cfg.signal_client,
             primary_contact: cfg.primary_contact,
+            channel:         cfg.channel,
             is_signal_reply: cfg.is_signal_reply,
+            user_requested_signal: cfg.user_requested_signal,
             code_index:      cfg.code_index,
         }
     }
@@ -857,7 +902,9 @@ impl ToolExecutor {
             subagent_mgr: None,
             signal_client: None,
             primary_contact: String::new(),
+            channel: String::new(),
             is_signal_reply: false,
+            user_requested_signal: false,
             code_index,
         }
     }
@@ -878,7 +925,16 @@ impl ToolExecutor {
         if self.skills.is_some() {
             defs.extend(skill_tool_definitions());
         }
-        if self.signal_client.is_some() && !self.is_signal_reply {
+        // signal_send is available only when:
+        //   (a) the message arrived via Signal (is_signal_reply) — kept for parity, 
+        //       though replies are auto-delivered; enables the agent to send extra msgs
+        //   (b) a task/heartbeat/scheduler channel triggered the turn (not "tui"/"signal")
+        //   (c) the TUI user explicitly requested a Signal notification in their message
+        // Deliberately excluded: plain TUI turns without explicit Signal intent.
+        let is_task_channel = !matches!(self.channel.as_str(), "tui" | "signal");
+        if self.signal_client.is_some()
+            && (self.is_signal_reply || is_task_channel || self.user_requested_signal)
+        {
             defs.push(signal_send_definition());
         }
         defs.extend(code_intel_tool_definitions());
@@ -1702,8 +1758,10 @@ mod tests {
             subagent_mgr: None,
             signal_client: None,
             primary_contact: String::new(),
+            channel: String::new(),
             soul_context: String::new(),
             is_signal_reply: false,
+            user_requested_signal: false,
             observer: None,
             code_index: Arc::new(CodeIndex::new()),
         })
@@ -1779,8 +1837,10 @@ mod tests {
             subagent_mgr: None,
             signal_client: None,
             primary_contact: String::new(),
+            channel: String::new(),
             soul_context: String::new(),
             is_signal_reply: false,
+            user_requested_signal: false,
             observer: None,
             code_index: Arc::new(CodeIndex::new()),
         });
@@ -1821,4 +1881,204 @@ mod tests {
         let result = executor.execute("memory_delete", &input).await;
         assert!(result.contains("deleted"));
     }
+    // -----------------------------------------------------------------------
+    // Tests for user_requests_signal()
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_user_requests_signal_positive_cases() {
+        assert!(user_requests_signal("can you send to signal once done"));
+        assert!(user_requests_signal("please send to my phone when finished"));
+        assert!(user_requests_signal("notify me on signal if it fails"));
+        assert!(user_requests_signal("message me on signal with the result"));
+        assert!(user_requests_signal("signal me when it's ready"));
+        assert!(user_requests_signal("ping me on signal"));
+        assert!(user_requests_signal("send via signal"));
+        assert!(user_requests_signal("let me know via signal"));
+        assert!(user_requests_signal("send me a signal when done"));
+    }
+
+    #[test]
+    fn test_user_requests_signal_negative_cases() {
+        assert!(!user_requests_signal("what time is it"));
+        assert!(!user_requests_signal("run cargo build and tell me if it passes"));
+        assert!(!user_requests_signal("schedule a task to monitor the server"));
+        assert!(!user_requests_signal("what's the weather like"));
+        assert!(!user_requests_signal("how's the signal strength on my wifi"));
+        assert!(!user_requests_signal("check for new emails"));
+    }
+
+    #[test]
+    fn test_user_requests_signal_case_insensitive() {
+        assert!(user_requests_signal("Send To Signal please"));
+        assert!(user_requests_signal("NOTIFY ME ON SIGNAL"));
+        assert!(user_requests_signal("Signal Me when ready"));
+    }
+
+    #[tokio::test]
+    async fn test_signal_send_excluded_from_plain_tui() {
+        // signal_send must NOT appear when channel="tui" and user didn't request it,
+        // even when a signal_client is configured.
+        use crate::claude::mock::MockLlm;
+        use crate::config::MemoryConfig;
+        use crate::embeddings::mock::MockEmbeddingClient;
+        use crate::tasks::TaskManager;
+        use std::path::Path;
+        use crate::signal::mock::MockSignalClient;
+
+        let llm = Arc::new(MockLlm::new(vec![]));
+        let embedder = Arc::new(MockEmbeddingClient::new(4));
+        let memory = Arc::new(
+            MemoryManager::new(
+                Path::new(":memory:"),
+                embedder,
+                MemoryConfig {
+                    max_memories: 100,
+                    top_k_retrieval: 5,
+                    importance_decay_days: 30.0,
+                    min_importance_to_keep: 0.1,
+                    ttl_days_episodic: 90.0,
+                },
+                4,
+            )
+            .await
+            .unwrap(),
+        );
+        let tasks = Arc::new(TaskManager::in_memory().await.unwrap());
+        let skills = Arc::new(crate::skills::SkillManager::in_memory().await.unwrap());
+        let signal_client: Option<Arc<dyn crate::signal::SignalClient>> =
+            Some(Arc::new(MockSignalClient::new(vec![])));
+        let executor = ToolExecutor::from_config(ToolExecutorConfig {
+            llm,
+            memory,
+            max_tokens: 1000,
+            tasks: Some(tasks),
+            skills: Some(skills),
+            job_store: None,
+            subagent_mgr: None,
+            signal_client,
+            primary_contact: "+1234".to_string(),
+            channel: "tui".to_string(),
+            soul_context: String::new(),
+            is_signal_reply: false,
+            user_requested_signal: false,
+            observer: None,
+            code_index: Arc::new(CodeIndex::new()),
+        });
+        let defs = executor.tool_definitions();
+        let names: Vec<_> = defs.iter().map(|d| d.name).collect();
+        assert!(!names.contains(&"signal_send"),
+            "signal_send must NOT appear for plain TUI turns: {names:?}");
+    }
+
+    #[tokio::test]
+    async fn test_signal_send_included_when_user_requested() {
+        // signal_send MUST appear when user_requested_signal=true (TUI with explicit intent).
+        use crate::claude::mock::MockLlm;
+        use crate::config::MemoryConfig;
+        use crate::embeddings::mock::MockEmbeddingClient;
+        use crate::tasks::TaskManager;
+        use std::path::Path;
+        use crate::signal::mock::MockSignalClient;
+
+        let llm = Arc::new(MockLlm::new(vec![]));
+        let embedder = Arc::new(MockEmbeddingClient::new(4));
+        let memory = Arc::new(
+            MemoryManager::new(
+                Path::new(":memory:"),
+                embedder,
+                MemoryConfig {
+                    max_memories: 100,
+                    top_k_retrieval: 5,
+                    importance_decay_days: 30.0,
+                    min_importance_to_keep: 0.1,
+                    ttl_days_episodic: 90.0,
+                },
+                4,
+            )
+            .await
+            .unwrap(),
+        );
+        let tasks = Arc::new(TaskManager::in_memory().await.unwrap());
+        let skills = Arc::new(crate::skills::SkillManager::in_memory().await.unwrap());
+        let signal_client: Option<Arc<dyn crate::signal::SignalClient>> =
+            Some(Arc::new(MockSignalClient::new(vec![])));
+        let executor = ToolExecutor::from_config(ToolExecutorConfig {
+            llm,
+            memory,
+            max_tokens: 1000,
+            tasks: Some(tasks),
+            skills: Some(skills),
+            job_store: None,
+            subagent_mgr: None,
+            signal_client,
+            primary_contact: "+1234".to_string(),
+            channel: "tui".to_string(),
+            soul_context: String::new(),
+            is_signal_reply: false,
+            user_requested_signal: true,
+            observer: None,
+            code_index: Arc::new(CodeIndex::new()),
+        });
+        let defs = executor.tool_definitions();
+        let names: Vec<_> = defs.iter().map(|d| d.name).collect();
+        assert!(names.contains(&"signal_send"),
+            "signal_send MUST appear when user_requested_signal=true: {names:?}");
+    }
+
+    #[tokio::test]
+    async fn test_signal_send_included_for_task_channel() {
+        // signal_send MUST appear when channel is not "tui" or "signal" (task/heartbeat).
+        use crate::claude::mock::MockLlm;
+        use crate::config::MemoryConfig;
+        use crate::embeddings::mock::MockEmbeddingClient;
+        use crate::tasks::TaskManager;
+        use std::path::Path;
+        use crate::signal::mock::MockSignalClient;
+
+        let llm = Arc::new(MockLlm::new(vec![]));
+        let embedder = Arc::new(MockEmbeddingClient::new(4));
+        let memory = Arc::new(
+            MemoryManager::new(
+                Path::new(":memory:"),
+                embedder,
+                MemoryConfig {
+                    max_memories: 100,
+                    top_k_retrieval: 5,
+                    importance_decay_days: 30.0,
+                    min_importance_to_keep: 0.1,
+                    ttl_days_episodic: 90.0,
+                },
+                4,
+            )
+            .await
+            .unwrap(),
+        );
+        let tasks = Arc::new(TaskManager::in_memory().await.unwrap());
+        let skills = Arc::new(crate::skills::SkillManager::in_memory().await.unwrap());
+        let signal_client: Option<Arc<dyn crate::signal::SignalClient>> =
+            Some(Arc::new(MockSignalClient::new(vec![])));
+        let executor = ToolExecutor::from_config(ToolExecutorConfig {
+            llm,
+            memory,
+            max_tokens: 1000,
+            tasks: Some(tasks),
+            skills: Some(skills),
+            job_store: None,
+            subagent_mgr: None,
+            signal_client,
+            primary_contact: "+1234".to_string(),
+            channel: "task".to_string(),
+            soul_context: String::new(),
+            is_signal_reply: false,
+            user_requested_signal: false,
+            observer: None,
+            code_index: Arc::new(CodeIndex::new()),
+        });
+        let defs = executor.tool_definitions();
+        let names: Vec<_> = defs.iter().map(|d| d.name).collect();
+        assert!(names.contains(&"signal_send"),
+            "signal_send MUST appear for task-channel turns: {names:?}");
+    }
+
 }

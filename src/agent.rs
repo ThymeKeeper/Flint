@@ -113,8 +113,10 @@ impl Agent {
             subagent_mgr:    Some(Arc::clone(&self.subagent_mgr)),
             signal_client:   self.signal_client.clone(),
             primary_contact: self.config.primary_contact.clone(),
+            channel:         channel.to_string(),
             soul_context,
             is_signal_reply: channel == "signal",
+            user_requested_signal: tools::user_requests_signal(text),
             observer:        observer.clone(),
             code_index:      self.code_index.clone(),
         });
@@ -279,10 +281,18 @@ impl Agent {
                  You are already linked and the daemon is running.\n\
                  \n\
                  When you receive a Signal message, just return your response — it is \
-                 automatically delivered back via Signal. Use `signal_send` only from TUI \
-                 conversations to proactively reach the user on their phone (e.g. task \
-                 completion, reminders, alerts). Do NOT invoke signal-cli via shell_exec — \
-                 a daemon owns the data directory and direct invocations will hang.\n",
+                 automatically delivered back via Signal. Do NOT call `signal_send` just \
+                 because Signal is configured. The `signal_send` tool is ONLY available \
+                 (and should ONLY be used) in these three situations:\
+                 (a) You are replying to a Signal message and need to send an extra notification.\
+                 (b) A background task or scheduler triggered this turn and you have a \
+                     result to report to the user's phone.\
+                 (c) The user explicitly asked you to notify them on Signal in this TUI \
+                     message (e.g. 'send to signal', 'notify me on signal', 'message \
+                     me on signal', 'signal me', 'ping me on signal', 'via signal'). \
+                 Calling `signal_send` outside these conditions sends an unwanted message \
+                 to the user's phone and must be avoided. Do NOT invoke signal-cli via \
+                 shell_exec — a daemon owns the data directory and direct invocations will hang.\n",
                 sc.phone_number
             )
         } else {
