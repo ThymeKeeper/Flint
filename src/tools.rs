@@ -13,6 +13,7 @@ use crate::memory::MemoryManager;
 use crate::observer::AgentObserver;
 use crate::signal::SignalClient;
 use crate::skills::{SkillManager, ALLOWED_SKILL_TOOLS};
+use crate::subagents::SubAgentManager;
 use crate::tasks::TaskManager;
 
 pub fn tool_definitions() -> Vec<ToolDefinition> {
@@ -237,7 +238,7 @@ fn is_system_path(path: &str) -> bool {
 // ToolExecutor
 // ---------------------------------------------------------------------------
 
-fn memory_tool_definitions() -> Vec<ToolDefinition> {
+pub fn memory_tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "memory_store",
@@ -693,7 +694,7 @@ fn trunc(s: &str, max: usize) -> String {
 }
 
 /// One-line summary of a tool call, injected as a stream chunk before execution.
-fn format_tool_call(name: &str, input: &Value) -> String {
+pub fn format_tool_call(name: &str, input: &Value) -> String {
     let detail = match name {
         "shell_exec" => {
             let cmd = trunc(input["command"].as_str().unwrap_or(""), 68);
@@ -722,6 +723,11 @@ fn format_tool_call(name: &str, input: &Value) -> String {
         "code_goto_definition" => format!("{}:{}:{}", input["path"].as_str().unwrap_or(""), input["line"], input["column"]),
         "code_find_references" => format!("{} in {}", input["symbol"].as_str().unwrap_or(""), input["directory"].as_str().unwrap_or("")),
         "code_diagnostics"     => input["path"].as_str().unwrap_or("").to_string(),
+        "plan_subagents"       => {
+            let n = input["steps"].as_array().map(|a| a.len()).unwrap_or(0);
+            format!("{n} steps")
+        },
+        "list_subagents"       => String::new(),
         _                => trunc(&input.to_string(), 72),
     };
     if detail.is_empty() {
@@ -732,7 +738,7 @@ fn format_tool_call(name: &str, input: &Value) -> String {
 }
 
 /// One-line summary of a tool result, injected as a stream chunk after execution.
-fn format_tool_result(result: &str) -> String {
+pub fn format_tool_result(result: &str) -> String {
     let first = result
         .lines()
         .find(|l| !l.trim().is_empty())
@@ -777,6 +783,7 @@ pub struct ToolExecutorConfig {
     pub tasks:           Option<Arc<TaskManager>>,
     pub skills:          Option<Arc<SkillManager>>,
     pub job_store:       Option<Arc<BackgroundJobStore>>,
+    pub subagent_mgr:    Option<Arc<SubAgentManager>>,
     pub signal_client:   Option<Arc<dyn SignalClient>>,
     pub primary_contact: String,
     pub soul_context:    String,
@@ -796,6 +803,8 @@ pub struct ToolExecutor {
     observer:       Option<Arc<dyn AgentObserver>>,
     /// Background job store — present for the main agent, absent for task runners.
     job_store:      Option<Arc<BackgroundJobStore>>,
+    /// Sub-agent manager — present for the main agent, absent for task runners/sub-agents.
+    subagent_mgr:   Option<Arc<SubAgentManager>>,
     /// Signal client for the `signal_send` tool — None when Signal not configured.
     signal_client:  Option<Arc<dyn SignalClient>>,
     /// Primary contact phone number (recipient for signal_send).
@@ -821,6 +830,7 @@ impl ToolExecutor {
             max_tokens:      cfg.max_tokens,
             observer:        cfg.observer,
             job_store:       cfg.job_store,
+            subagent_mgr:    cfg.subagent_mgr,
             signal_client:   cfg.signal_client,
             primary_contact: cfg.primary_contact,
             is_signal_reply: cfg.is_signal_reply,
@@ -844,6 +854,7 @@ impl ToolExecutor {
             max_tokens,
             observer: None,
             job_store: None,
+            subagent_mgr: None,
             signal_client: None,
             primary_contact: String::new(),
             is_signal_reply: false,
@@ -851,11 +862,16 @@ impl ToolExecutor {
         }
     }
 
-    /// Full agent tool set: base + memory + spawn_subagent + task + skill management.
+    /// Full agent tool set: base + memory + subagent tools + task + skill management.
     pub fn tool_definitions(&self) -> Vec<ToolDefinition> {
         let mut defs = tool_definitions();
         defs.extend(memory_tool_definitions());
-        defs.push(spawn_subagent_definition());
+        if self.subagent_mgr.is_some() {
+            defs.extend(crate::subagents::subagent_tool_definitions());
+        } else {
+            // Fallback: include old-style blocking spawn for contexts without SubAgentManager.
+            defs.push(spawn_subagent_definition());
+        }
         if self.tasks.is_some() {
             defs.extend(task_tool_definitions());
         }
@@ -908,7 +924,9 @@ impl ToolExecutor {
             "memory_search"  => self.memory_search(input).await,
             "memory_update"  => self.memory_update(input).await,
             "memory_delete"  => self.memory_delete(input).await,
-            "spawn_subagent" => self.spawn_subagent(input).await,
+            "spawn_subagent" => self.spawn_subagent_dispatch(input).await,
+            "plan_subagents" => self.plan_subagents(input).await,
+            "list_subagents" => self.list_subagents().await,
             "schedule_task"        => self.schedule_task(input).await,
             "schedule_script_task" => self.schedule_script_task(input).await,
             "list_tasks"           => self.list_tasks().await,
@@ -1267,15 +1285,17 @@ impl ToolExecutor {
     }
 
     // -----------------------------------------------------------------------
-    // spawn_subagent — with soul context injection and optional skill profile
+    // spawn_subagent — background dispatch (or blocking fallback)
     // -----------------------------------------------------------------------
 
-    async fn spawn_subagent(&self, input: &Value) -> String {
+    /// Dispatch spawn_subagent: if SubAgentManager is available, spawn in
+    /// background and return immediately. Otherwise fall back to blocking.
+    async fn spawn_subagent_dispatch(&self, input: &Value) -> String {
         let task = match input["task"].as_str() {
             Some(t) => t,
             None => return "Error: missing 'task' field".to_string(),
         };
-        let context = input["context"].as_str().unwrap_or("");
+        let context = input["context"].as_str().unwrap_or("").to_string();
         let skill_name = input["skill"].as_str();
 
         // Resolve skill if requested.
@@ -1294,8 +1314,39 @@ impl ToolExecutor {
             None
         };
 
-        // Build the system prompt: soul context first, then agent identity.
-        let base_identity = match &skill {
+        // Background path: use SubAgentManager.
+        if let Some(mgr) = &self.subagent_mgr {
+            let id = mgr.spawn(
+                task.to_string(),
+                context,
+                skill,
+                self.soul_context.clone(),
+                self.llm.clone(),
+                self.memory.clone(),
+                self.max_tokens,
+                self.code_index.clone(),
+                None,
+                None,
+            ).await;
+            return format!(
+                "sub-agent:{id} started in background — working on: {}. \
+                 You will be notified when it completes.",
+                trunc(task, 60)
+            );
+        }
+
+        // Blocking fallback (no SubAgentManager — e.g. task runners).
+        self.spawn_subagent_blocking(task, &context, skill.as_ref()).await
+    }
+
+    /// Blocking sub-agent execution (original inline approach).
+    async fn spawn_subagent_blocking(
+        &self,
+        task: &str,
+        context: &str,
+        skill: Option<&crate::skills::SkillEntry>,
+    ) -> String {
+        let base_identity = match skill {
             Some(s) => s.system_prompt.clone(),
             None => "You are a focused sub-agent. Complete the assigned task thoroughly \
                 using the available tools. Do not spawn further sub-agents."
@@ -1308,8 +1359,7 @@ impl ToolExecutor {
             format!("{}\n\n---\n\n{}", self.soul_context, base_identity)
         };
 
-        // Determine allowed tools for this sub-agent.
-        let allowed: Vec<&str> = match &skill {
+        let allowed: Vec<&str> = match skill {
             Some(s) => s.tools.iter().map(|t| t.as_str()).collect(),
             None => ALLOWED_SKILL_TOOLS.to_vec(),
         };
@@ -1372,6 +1422,65 @@ impl ToolExecutor {
                 content: MessageContent::Blocks(results),
             });
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // plan_subagents — DAG-based multi-step execution
+    // -----------------------------------------------------------------------
+
+    async fn plan_subagents(&self, input: &Value) -> String {
+        let mgr = match &self.subagent_mgr {
+            Some(m) => m,
+            None => return "Error: sub-agent coordination not available in this context".to_string(),
+        };
+
+        let steps: Vec<crate::subagents::PlanStep> = match serde_json::from_value(
+            input["steps"].clone(),
+        ) {
+            Ok(s) => s,
+            Err(e) => return format!("Error parsing steps: {e}"),
+        };
+
+        mgr.execute_plan(
+            steps,
+            self.soul_context.clone(),
+            self.llm.clone(),
+            self.memory.clone(),
+            self.max_tokens,
+            self.code_index.clone(),
+            self.skills.clone(),
+        )
+        .await
+    }
+
+    // -----------------------------------------------------------------------
+    // list_subagents — show active sub-agents
+    // -----------------------------------------------------------------------
+
+    async fn list_subagents(&self) -> String {
+        let mgr = match &self.subagent_mgr {
+            Some(m) => m,
+            None => return "No sub-agent manager available".to_string(),
+        };
+
+        let active = mgr.list().await;
+        if active.is_empty() {
+            return "No active sub-agents.".to_string();
+        }
+
+        let items: Vec<serde_json::Value> = active
+            .iter()
+            .map(|sa| {
+                serde_json::json!({
+                    "id": sa.id,
+                    "task": sa.task,
+                    "skill": sa.skill,
+                    "plan_id": sa.plan_id,
+                    "step_id": sa.step_id,
+                })
+            })
+            .collect();
+        serde_json::to_string_pretty(&items).unwrap_or_else(|_| "[]".to_string())
     }
 
     // -----------------------------------------------------------------------
@@ -1590,6 +1699,7 @@ mod tests {
             tasks: Some(tasks),
             skills: Some(skills),
             job_store: None,
+            subagent_mgr: None,
             signal_client: None,
             primary_contact: String::new(),
             soul_context: String::new(),
@@ -1603,7 +1713,7 @@ mod tests {
     async fn test_executor_tool_definitions() {
         let executor = test_executor().await;
         let defs = executor.tool_definitions();
-        // 4 base + 4 memory + spawn_subagent + 4 task + 4 skill + 4 code_intel = 21 (no signal_send, signal_client is None)
+        // 4 base + 4 memory + spawn_subagent (fallback, no mgr) + 4 task + 4 skill + 4 code_intel = 21
         assert_eq!(defs.len(), 21);
         let names: Vec<_> = defs.iter().map(|d| d.name).collect();
         assert!(names.contains(&"spawn_subagent"));
@@ -1666,6 +1776,7 @@ mod tests {
             tasks: Some(tasks),
             skills: Some(skills),
             job_store: None,
+            subagent_mgr: None,
             signal_client: None,
             primary_contact: String::new(),
             soul_context: String::new(),

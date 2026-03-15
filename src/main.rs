@@ -17,6 +17,7 @@ use flint::setup;
 use flint::signal::{SignalClient, SignalTcpRpcClient, TuiSignalClient};
 use flint::signal_daemon;
 use flint::skills::SkillManager;
+use flint::subagents::SubAgentManager;
 use flint::tasks::TaskManager;
 
 #[tokio::main]
@@ -143,6 +144,10 @@ async fn main() -> Result<()> {
 
     // ── TUI signal client ─────────────────────────────────────────────────────
     let (tui_channels, user_input_tx, agent_update_rx) = flint::tui::create_channels();
+
+    // ── Sub-agent manager (needs agent_update_tx for TUI streaming) ──────────
+    let (subagent_mgr, mut subagent_notify_rx) =
+        SubAgentManager::new(tui_channels.agent_update_tx.clone());
     let tui_client = Arc::new(TuiSignalClient::new(tui_channels));
 
     // Push persisted history to TUI before it starts rendering.
@@ -230,6 +235,7 @@ async fn main() -> Result<()> {
         tasks.clone(),
         skills.clone(),
         job_store,
+        subagent_mgr,
         conv_store,
         config.clone(),
         history,
@@ -272,7 +278,7 @@ async fn main() -> Result<()> {
                     }
                     Err(e) => error!("TUI receive error: {e:#}"),
                 }
-                drain_jobs(&agent, &tui_dyn, signal_rest.as_ref(), &config.primary_contact, &mut job_notify_rx, &tui_client).await;
+                drain_jobs(&agent, &tui_dyn, signal_rest.as_ref(), &config.primary_contact, &mut job_notify_rx, &mut subagent_notify_rx, &tui_client).await;
             }
 
             // Signal TCP notification client — blocks until a message arrives,
@@ -317,11 +323,23 @@ async fn main() -> Result<()> {
                         tokio::time::sleep(signal_poll_interval).await;
                     }
                 }
-                drain_jobs(&agent, &tui_dyn, signal_rest.as_ref(), &config.primary_contact, &mut job_notify_rx, &tui_client).await;
+                drain_jobs(&agent, &tui_dyn, signal_rest.as_ref(), &config.primary_contact, &mut job_notify_rx, &mut subagent_notify_rx, &tui_client).await;
             }
 
             // Background job completion — immediate, no sleep
             Some(notification) = job_notify_rx.recv() => {
+                let text = notification.to_agent_text();
+                tui_client.push_notification(text.clone());
+                let obs: Option<Arc<dyn AgentObserver>> =
+                    Some(tui_client.clone() as Arc<dyn AgentObserver>);
+                let resp = handle_turn_ret(&agent, &tui_dyn, "system", &config.primary_contact, &text, "tui", obs).await;
+                if let (Some(r), Some(sr)) = (resp, &signal_rest) {
+                    let _ = sr.send(&config.primary_contact, &r.display_text()).await;
+                }
+            }
+
+            // Sub-agent completion — inject result as a synthetic message
+            Some(notification) = subagent_notify_rx.recv() => {
                 let text = notification.to_agent_text();
                 tui_client.push_notification(text.clone());
                 let obs: Option<Arc<dyn AgentObserver>> =
@@ -378,16 +396,27 @@ async fn handle_turn(
     handle_turn_ret(agent, signal, sender, recipient, text, channel, observer).await;
 }
 
-/// Drain pending job notifications immediately after a user turn.
+/// Drain pending job and sub-agent notifications immediately after a user turn.
 async fn drain_jobs(
     agent: &Agent,
     tui: &Arc<dyn SignalClient>,
     signal_rest: Option<&Arc<dyn SignalClient>>,
     primary_contact: &str,
     job_notify_rx: &mut tokio::sync::mpsc::Receiver<flint::jobs::JobNotification>,
+    subagent_notify_rx: &mut tokio::sync::mpsc::Receiver<flint::subagents::SubAgentNotification>,
     tui_client: &Arc<TuiSignalClient>,
 ) {
     while let Ok(notification) = job_notify_rx.try_recv() {
+        let text = notification.to_agent_text();
+        tui.push_notification(text.clone());
+        let obs: Option<Arc<dyn AgentObserver>> =
+            Some(tui_client.clone() as Arc<dyn AgentObserver>);
+        let resp = handle_turn_ret(agent, tui, "system", primary_contact, &text, "tui", obs).await;
+        if let (Some(r), Some(sr)) = (resp, signal_rest) {
+            let _ = sr.send(primary_contact, &r.display_text()).await;
+        }
+    }
+    while let Ok(notification) = subagent_notify_rx.try_recv() {
         let text = notification.to_agent_text();
         tui.push_notification(text.clone());
         let obs: Option<Arc<dyn AgentObserver>> =

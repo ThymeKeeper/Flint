@@ -13,6 +13,7 @@ use flint::embeddings::mock::MockEmbeddingClient;
 use flint::jobs::BackgroundJobStore;
 use flint::memory::MemoryManager;
 use flint::skills::SkillManager;
+use flint::subagents::SubAgentManager;
 use flint::tasks::TaskManager;
 
 fn test_config() -> AppConfig {
@@ -70,6 +71,9 @@ async fn build_agent(llm_responses: Vec<String>) -> Arc<Agent> {
     let tasks = Arc::new(TaskManager::in_memory().await.unwrap());
     let skills = Arc::new(SkillManager::in_memory().await.unwrap());
     let (jobs, _) = BackgroundJobStore::new();
+    // SubAgentManager needs a TUI tx — create a dummy channel for tests.
+    let (dummy_tui_tx, _dummy_tui_rx) = tokio::sync::mpsc::channel(16);
+    let (subagent_mgr, _) = SubAgentManager::new(dummy_tui_tx);
     let conv_store = Arc::new(ConversationStore::new(memory.connection()).unwrap());
     // Utility LLM handles memory extraction/consolidation — needs enough responses.
     let utility_llm = Arc::new(MockLlm::new(vec![
@@ -77,7 +81,7 @@ async fn build_agent(llm_responses: Vec<String>) -> Arc<Agent> {
     ]));
     let code_index = Arc::new(flint::code_intel::CodeIndex::new());
     Arc::new(Agent::new(
-        soul, llm, utility_llm, memory, tasks, skills, jobs, conv_store, config, vec![], None, code_index,
+        soul, llm, utility_llm, memory, tasks, skills, jobs, subagent_mgr, conv_store, config, vec![], None, code_index,
     ))
 }
 

@@ -13,6 +13,7 @@ use crate::observer::AgentObserver;
 use crate::skills::SkillManager;
 use crate::tasks::TaskManager;
 use crate::code_intel::CodeIndex;
+use crate::subagents::SubAgentManager;
 use crate::tools::{self, ToolExecutorConfig};
 
 // ---------------------------------------------------------------------------
@@ -28,6 +29,7 @@ pub struct Agent {
     pub tasks: Arc<TaskManager>,
     pub skills: Arc<SkillManager>,
     pub jobs: Arc<BackgroundJobStore>,
+    pub subagent_mgr: Arc<SubAgentManager>,
     pub conv_store: Arc<ConversationStore>,
     pub context: RwLock<ConversationContext>,
     pub config: AppConfig,
@@ -49,6 +51,7 @@ impl Agent {
         tasks: Arc<TaskManager>,
         skills: Arc<SkillManager>,
         jobs: Arc<BackgroundJobStore>,
+        subagent_mgr: Arc<SubAgentManager>,
         conv_store: Arc<ConversationStore>,
         config: AppConfig,
         history: Vec<StoredTurn>,
@@ -68,7 +71,7 @@ impl Agent {
             };
             context.push(role, content);
         }
-        Self { soul, llm, utility_llm, memory, tasks, skills, jobs, conv_store, context: RwLock::new(context), config, signal_client, code_index }
+        Self { soul, llm, utility_llm, memory, tasks, skills, jobs, subagent_mgr, conv_store, context: RwLock::new(context), config, signal_client, code_index }
     }
 
     /// Handle an incoming message: retrieve memories, generate response, store memories.
@@ -107,6 +110,7 @@ impl Agent {
             tasks:           Some(self.tasks.clone()),
             skills:          Some(self.skills.clone()),
             job_store:       Some(Arc::clone(&self.jobs)),
+            subagent_mgr:    Some(Arc::clone(&self.subagent_mgr)),
             signal_client:   self.signal_client.clone(),
             primary_contact: self.config.primary_contact.clone(),
             soul_context,
@@ -318,7 +322,21 @@ impl Agent {
              - **Semantic memory**: Separate from conversation history, important facts are \
              extracted and stored as embeddings in DuckDB after each exchange. Use \
              `memory_search` to query them.\n\
-             - **Background tasks**: Scheduled tasks run independently and report via Signal.\n";
+             - **Background tasks**: Scheduled tasks run independently and report via Signal.\n\
+             \n\
+             ## Sub-Agent Strategy\n\
+             You have powerful sub-agent capabilities. Use them aggressively:\n\
+             - **Any task requiring more than 2 tool calls**: delegate to a sub-agent.\n\
+             - **Research tasks**: always use a sub-agent to preserve your context window.\n\
+             - **Multi-file operations**: spawn sub-agents to work on different files in parallel.\n\
+             - **Complex analysis**: chain sub-agents where each step builds on the previous using `plan_subagents`.\n\
+             - Sub-agents run in the BACKGROUND — you stay responsive to the user.\n\
+             - The user can see live sub-agent activity in TUI activity boxes.\n\
+             - When a sub-agent finishes, you will be prompted to relay its results.\n\
+             - Use `spawn_subagent` for simple one-off delegations.\n\
+             - Use `plan_subagents` for complex workflows with dependencies.\n\
+             - Use `list_subagents` to check on running sub-agents.\n\
+             - Only handle trivial tasks (quick memory lookups, simple replies) directly.\n";
 
         // Generate the tool section dynamically from live ToolDefinition structs,
         // so flint always has accurate self-knowledge about its tools.
@@ -333,7 +351,9 @@ impl Agent {
                  - memory_search: find memories by semantic query.\n\
                  - memory_update: correct or replace a memory's content; re-embeds automatically.\n\
                  - memory_delete: permanently remove a fully obsolete memory.\n\
-                 - spawn_subagent: delegate a self-contained task to an isolated sub-agent.\n\
+                 - spawn_subagent: runs in the BACKGROUND. Returns immediately with a sub-agent ID. You are notified when it completes. Use for any non-trivial task.\n\
+                 - plan_subagents: orchestrate multiple sub-agents with dependencies. Steps without dependencies run in parallel. Use for complex multi-step workflows.\n\
+                 - list_subagents: check on currently running sub-agents.\n\
                  - schedule_task: create a background task that runs autonomously on a schedule (uses LLM). The task runner has shell_exec, web_fetch, file_read, file_write, memory_search, and memory_store. Use trigger_type='interval' (seconds), 'cron' (HH:MM UTC), or 'once' (RFC3339 timestamp). Set max_idle_runs higher (e.g. 100) for long-wait monitoring — the runner uses 'still_waiting' state to stay alive without wasting idle budget.\n\
                  - schedule_script_task: create a mechanical background task (NO LLM cost). Runs a shell command and checks output against a regex pattern. Prefer this over schedule_task when the task is just 'run a command and check the result'. Use {{output}} in message_template.\n\
                  - list_tasks: show all scheduled tasks with their status and next run time.\n\

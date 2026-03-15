@@ -54,6 +54,15 @@ pub enum AgentUpdate {
     HistoryLoaded(Vec<(String, String)>),
     /// Append new turns to the end of the chat (e.g. from Signal exchanges).
     NewTurns(Vec<(String, String)>),
+    // ── Sub-agent activity events ─────────────────────────────────────────
+    /// A sub-agent was spawned — show its activity box.
+    SubAgentStarted { id: u64, task: String },
+    /// Streaming text from a sub-agent.
+    SubAgentChunk { id: u64, chunk: String },
+    /// Tool activity from a sub-agent.
+    SubAgentToolEvent { id: u64, text: String },
+    /// Sub-agent completed — remove its activity box.
+    SubAgentCompleted { id: u64, result_summary: String },
 }
 
 /// Channel endpoints owned by `TuiSignalClient`.
@@ -87,6 +96,17 @@ struct ChatMessage {
     text: String,
     streaming: bool,
 }
+
+/// State for a live sub-agent activity box in the TUI.
+struct SubAgentBox {
+    id: u64,
+    task: String,
+    /// Rolling buffer of recent output, capped at MAX_SA_BOX_CHARS.
+    output: String,
+}
+
+const MAX_SA_BOX_CHARS: usize = 2000;
+const MAX_VISIBLE_SA_BOXES: usize = 4;
 
 // ---------------------------------------------------------------------------
 // TUI entry point
@@ -124,6 +144,7 @@ pub fn run_tui(
     let mut auto_scroll = true;
     let mut h_scroll: usize = 0; // chars scrolled right on nowrap (table/code) lines
     let mut tool_status: Option<String> = None;
+    let mut sa_boxes: Vec<SubAgentBox> = Vec::new();
     // System clipboard — may be unavailable in headless/Wayland-without-display environments.
     let mut clipboard = Clipboard::new().ok();
 
@@ -223,6 +244,32 @@ pub fn run_tui(
                         scroll_up = 0;
                     }
                 }
+                // ── Sub-agent activity events ──────────────────────────────
+                Ok(AgentUpdate::SubAgentStarted { id, task }) => {
+                    sa_boxes.push(SubAgentBox {
+                        id,
+                        task,
+                        output: String::new(),
+                    });
+                }
+                Ok(AgentUpdate::SubAgentChunk { id, chunk }) => {
+                    if let Some(b) = sa_boxes.iter_mut().find(|b| b.id == id) {
+                        b.output.push_str(&chunk);
+                        truncate_sa_output(&mut b.output);
+                    }
+                }
+                Ok(AgentUpdate::SubAgentToolEvent { id, text }) => {
+                    if let Some(b) = sa_boxes.iter_mut().find(|b| b.id == id) {
+                        if !b.output.ends_with('\n') && !b.output.is_empty() {
+                            b.output.push('\n');
+                        }
+                        b.output.push_str(&text);
+                        truncate_sa_output(&mut b.output);
+                    }
+                }
+                Ok(AgentUpdate::SubAgentCompleted { id, result_summary: _ }) => {
+                    sa_boxes.retain(|b| b.id != id);
+                }
                 Err(_) => break,
             }
         }
@@ -231,10 +278,13 @@ pub fn run_tui(
         let waiting = messages.last().map(|m| m.streaming).unwrap_or(false);
 
         // Update textarea decoration to reflect waiting/tool state.
+        let sa_count = sa_boxes.len();
         let input_title = match &tool_status {
             Some(name) if name == "spawn_subagent" => " sub-agent (locked) ".to_string(),
             Some(name) => format!(" {} ", name),
+            None if waiting && sa_count > 0 => format!(" Waiting… ({sa_count} sub-agents) "),
             None if waiting => " Waiting… ".to_string(),
+            None if sa_count > 0 => format!(" You  ({sa_count} sub-agents) "),
             None => " You ".to_string(),
         };
         let input_style = if waiting {
@@ -254,13 +304,38 @@ pub fn run_tui(
                 let content_rows = textarea.lines().len() as u16;
                 let input_height = (content_rows + 2).max(3).min(area.height / 3).max(3);
 
+                // Sub-agent panel height: only visible when sub-agents are active.
+                let sa_panel_height = if sa_boxes.is_empty() {
+                    0u16
+                } else {
+                    // Each box gets ≥4 rows; cap total panel at 1/3 of screen.
+                    let visible_boxes = sa_boxes.len().min(MAX_VISIBLE_SA_BOXES);
+                    let per_box = 6u16;
+                    let raw = (visible_boxes as u16 * per_box).max(per_box);
+                    raw.min(area.height / 3).max(4)
+                };
+
+                let constraints = if sa_panel_height > 0 {
+                    vec![
+                        Constraint::Min(3),
+                        Constraint::Length(sa_panel_height),
+                        Constraint::Length(input_height),
+                    ]
+                } else {
+                    vec![
+                        Constraint::Min(3),
+                        Constraint::Length(input_height),
+                    ]
+                };
+
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints([Constraint::Min(3), Constraint::Length(input_height)])
+                    .constraints(constraints)
                     .split(area);
 
-                let chat_area = chunks[0];
-                let input_area = chunks[1];
+                let chat_area = if sa_panel_height > 0 { chunks[0] } else { chunks[0] };
+                let sa_area = if sa_panel_height > 0 { Some(chunks[1]) } else { None };
+                let input_area = if sa_panel_height > 0 { chunks[2] } else { chunks[1] };
 
                 let inner_width = chat_area.width.saturating_sub(2); // L+R borders
                 let tagged = build_chat_lines(&messages);
@@ -301,6 +376,12 @@ pub fn run_tui(
                 let chat_para =
                     Paragraph::new(lines).block(chat_block).scroll((scroll_top, 0));
                 frame.render_widget(chat_para, chat_area);
+
+                // ── Sub-agent activity panel ──────────────────────────────────
+                if let Some(sa_rect) = sa_area {
+                    render_subagent_panel(frame, sa_rect, &sa_boxes);
+                }
+
                 frame.render_widget(&textarea, input_area);
             })
             .ok();
@@ -531,6 +612,95 @@ pub fn run_tui(
             Ok(Event::Resize(_, _)) => {} // redrawn on next iteration
             _ => {}
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sub-agent panel rendering
+// ---------------------------------------------------------------------------
+
+/// Render the sub-agent activity panel as a horizontal split of bordered boxes.
+fn render_subagent_panel(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    boxes: &[SubAgentBox],
+) {
+    if boxes.is_empty() {
+        return;
+    }
+
+    let visible = &boxes[boxes.len().saturating_sub(MAX_VISIBLE_SA_BOXES)..];
+    let n = visible.len();
+    let overflow = boxes.len().saturating_sub(MAX_VISIBLE_SA_BOXES);
+
+    // Split horizontally: equal width per box.
+    let constraints: Vec<Constraint> = (0..n)
+        .map(|_| Constraint::Ratio(1, n as u32))
+        .collect();
+    let box_areas = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(constraints)
+        .split(area);
+
+    for (i, sa) in visible.iter().enumerate() {
+        let title = if overflow > 0 && i == 0 {
+            format!(" +{overflow} | ◈ {} ", trunc_str(&sa.task, 30))
+        } else {
+            format!(" ◈ {} ", trunc_str(&sa.task, 40))
+        };
+
+        let inner_height = box_areas[i].height.saturating_sub(2) as usize;
+        let inner_width = box_areas[i].width.saturating_sub(2) as usize;
+
+        // Take the last N lines that fit.
+        let output_lines: Vec<Line<'static>> = sa.output
+            .lines()
+            .rev()
+            .take(inner_height)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(|l| {
+                let display: String = l.chars().take(inner_width).collect();
+                Line::from(Span::styled(display, Style::default().fg(Color::DarkGray)))
+            })
+            .collect();
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title(Span::styled(title, Style::default().fg(Color::Yellow)));
+
+        let para = Paragraph::new(output_lines).block(block);
+        frame.render_widget(para, box_areas[i]);
+    }
+}
+
+/// Trim a sub-agent output buffer to MAX_SA_BOX_CHARS, respecting UTF-8 char
+/// boundaries and snapping to the next newline so partial lines are dropped.
+fn truncate_sa_output(buf: &mut String) {
+    if buf.len() <= MAX_SA_BOX_CHARS {
+        return;
+    }
+    let mut start = buf.len() - MAX_SA_BOX_CHARS;
+    // Walk forward to the next char boundary.
+    while start < buf.len() && !buf.is_char_boundary(start) {
+        start += 1;
+    }
+    // Then find the next newline so we don't start mid-line.
+    let trim = match buf[start..].find('\n') {
+        Some(pos) => start + pos + 1,
+        None => start,
+    };
+    *buf = buf[trim..].to_string();
+}
+
+fn trunc_str(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let t: String = s.chars().take(max).collect();
+        format!("{t}…")
     }
 }
 

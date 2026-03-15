@@ -13,6 +13,7 @@ pub mod setup;
 pub mod signal;
 pub mod signal_daemon;
 pub mod skills;
+pub mod subagents;
 pub mod tasks;
 pub mod tools;
 pub mod tui;
