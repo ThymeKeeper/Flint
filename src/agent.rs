@@ -237,11 +237,12 @@ impl Agent {
         let llm = self.utility_llm.clone();
         let exchange_text = format!("User: {text}\nAssistant: {final_text}");
         let id_sims = mem_id_sims.clone();
+        let channel_owned = channel.to_string();
         tokio::spawn(async move {
             if let Err(e) = memory_mgr.mark_accessed(&id_sims).await {
                 warn!("Failed to mark memories accessed: {e:#}");
             }
-            if let Err(e) = extract_and_store_memories(&memory_mgr, &llm, &exchange_text).await {
+            if let Err(e) = extract_and_store_memories(&memory_mgr, &llm, &exchange_text, &channel_owned).await {
                 warn!("Memory extraction failed: {e:#}");
             }
             if let Err(e) = consolidate_memories(&memory_mgr, &llm).await {
@@ -570,32 +571,33 @@ async fn extract_and_store_memories(
     memory: &MemoryManager,
     llm: &Arc<dyn LlmClient>,
     exchange: &str,
+    channel: &str,
 ) -> Result<()> {
-    debug!("Extracting memories from exchange");
+    info!("Extracting memories from exchange");
 
     let response = llm
         .complete(ClaudeRequest {
-            system: "You decide whether a conversation contains facts worth remembering \
-                     long-term. You are VERY selective — most conversations produce nothing. \
-                     Return only valid JSON.",
+            system: "You extract useful facts from conversations for long-term memory. \
+                     Extract anything that may be helpful to recall in future sessions. \
+                     The importance score handles filtering — err on the side of capturing \
+                     potentially useful information. Return only valid JSON.",
             messages: vec![ApiMessage {
                 role: "user".to_string(),
                 content: MessageContent::Text(format!(
-                    "Review this exchange and extract ONLY facts that would be valuable to \
-                     recall weeks or months from now. Return a JSON array of objects with \
+                    "Review this exchange and extract facts that could be valuable to \
+                     recall in future sessions. Return a JSON array of objects with \
                      \"content\" (string) and \"importance\" (float 0-1).\n\n\
                      ## Importance scale\n\
                      0.9-1.0: Life events, critical preferences, allergies, key relationships\n\
                      0.7-0.8: Stated preferences, ongoing projects, goals, technical setup\n\
                      0.5-0.6: Opinions, interests, recurring topics worth noting\n\
-                     Below 0.5: Not worth storing — return [] instead\n\n\
+                     Below 0.5: Not worth storing\n\n\
                      ## DO NOT extract\n\
                      - Greetings, small talk, pleasantries\n\
                      - Things the assistant said or did (tool calls, responses)\n\
                      - Anything the user would not expect to be remembered\n\
                      - Transient context (\"I'm tired\", \"just got home\")\n\
                      - Facts already obvious from the conversation flow\n\n\
-                     Return [] if nothing crosses the 0.5 threshold. Most exchanges produce [].\n\n\
                      {exchange}"
                 )),
             }],
@@ -613,7 +615,7 @@ async fn extract_and_store_memories(
     let extracts: Vec<Extract> = match serde_json::from_str(&response) {
         Ok(v) => v,
         Err(e) => {
-            debug!("Failed to parse memory extraction response: {e}");
+            warn!("Failed to parse memory extraction response: {e}");
             return Ok(());
         }
     };
@@ -623,13 +625,13 @@ async fn extract_and_store_memories(
         let importance = e.importance.clamp(0.0, 1.0);
         if importance >= 0.5 {
             memory
-                .store(&e.content, MemoryKind::Episodic, "signal", importance)
+                .store(&e.content, MemoryKind::Episodic, channel, importance)
                 .await?;
             stored += 1;
         }
     }
 
-    debug!("Memory extraction: {} candidates, {} stored (threshold 0.5)", extracts.len(), stored);
+    info!("Memory extraction: {} candidates, {} stored (threshold 0.5)", extracts.len(), stored);
     Ok(())
 }
 

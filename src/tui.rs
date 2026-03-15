@@ -1099,15 +1099,50 @@ fn build_display_lines(
             full_lines.push(Line::from(chars_to_spans(&chars)));
             is_nowrap_row.push(true);
         } else {
+            // Detect the leading indent of this line (spaces at the start)
+            // so we can replicate it on wrapped continuation lines.
+            let indent_len = chars.iter().take_while(|(c, _)| *c == ' ').count();
+            let indent_style = chars.first().map(|(_, s)| *s).unwrap_or_default();
+
             let mut start = 0;
+            let mut is_first_chunk = true;
             while start < chars.len() {
-                let end = (start + w).min(chars.len());
-                let chunk = Line::from(chars_to_spans(&chars[start..end]));
-                lines.push(chunk.clone());
-                soft_wraps.push(end < chars.len());
-                full_lines.push(chunk);
-                is_nowrap_row.push(false);
-                start = end;
+                if is_first_chunk {
+                    // First chunk: render as-is (already has indent).
+                    let end = (start + w).min(chars.len());
+                    let chunk = Line::from(chars_to_spans(&chars[start..end]));
+                    lines.push(chunk.clone());
+                    soft_wraps.push(end < chars.len());
+                    full_lines.push(chunk);
+                    is_nowrap_row.push(false);
+                    start = end;
+                    is_first_chunk = false;
+                } else {
+                    // Continuation: prepend the same indent, fill remaining width.
+                    let content_w = w.saturating_sub(indent_len);
+                    if content_w == 0 {
+                        // Terminal too narrow for indent — just chunk without it.
+                        let end = (start + w).min(chars.len());
+                        let chunk = Line::from(chars_to_spans(&chars[start..end]));
+                        lines.push(chunk.clone());
+                        soft_wraps.push(end < chars.len());
+                        full_lines.push(chunk);
+                        is_nowrap_row.push(false);
+                        start = end;
+                    } else {
+                        let end = (start + content_w).min(chars.len());
+                        let indent_chars: Vec<(char, Style)> =
+                            std::iter::repeat((' ', indent_style)).take(indent_len).collect();
+                        let mut combined = indent_chars;
+                        combined.extend_from_slice(&chars[start..end]);
+                        let chunk = Line::from(chars_to_spans(&combined));
+                        lines.push(chunk.clone());
+                        soft_wraps.push(end < chars.len());
+                        full_lines.push(chunk);
+                        is_nowrap_row.push(false);
+                        start = end;
+                    }
+                }
             }
         }
     }

@@ -167,7 +167,7 @@ impl ClaudeClient {
                     .as_str()
                     .is_some_and(|id| id.starts_with(family))
             })
-            .max_by_key(|m| m["created_at"].as_str().unwrap_or("").to_string())
+            .max_by_key(|m| m["created_at"].as_i64().unwrap_or(0))
             .and_then(|m| m["id"].as_str().map(|s| s.to_string()))
     }
 
