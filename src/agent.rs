@@ -473,14 +473,40 @@ impl AgentResponse {
 
 /// Remove a trailing `[Tools called this turn ...]` block from model output.
 /// The model sometimes mimics this pattern from conversation history.
+/// If the block contains a fake signal_send() call, extract the message
+/// content so the response isn't silently lost.
 fn strip_tool_log_block(text: &str) -> String {
-    if let Some(start) = text.find("\n[Tools called this turn") {
-        text[..start].trim_end().to_string()
+    let (before, block) = if let Some(start) = text.find("\n[Tools called this turn") {
+        (text[..start].trim_end(), &text[start..])
     } else if text.starts_with("[Tools called this turn") {
-        String::new()
+        ("", text.as_ref())
     } else {
-        text.to_string()
+        return text.to_string();
+    };
+
+    // If the model faked a signal_send(), salvage the message content.
+    // Pattern: signal_send(actual message text) → ...
+    if !before.is_empty() {
+        return before.to_string();
     }
+    if let Some(msg) = extract_fake_signal_send(block) {
+        return msg;
+    }
+    String::new()
+}
+
+/// Extract the message body from a fake `signal_send(...)` in a tool log block.
+fn extract_fake_signal_send(block: &str) -> Option<String> {
+    let marker = "signal_send(";
+    let start = block.find(marker)? + marker.len();
+    let rest = &block[start..];
+    // The message ends at ") →" or ")\n" or end of the parenthesized content.
+    let end = rest.find(") →")
+        .or_else(|| rest.find(")\n"))
+        .or_else(|| rest.rfind(')'))
+        .unwrap_or(rest.len());
+    let msg = rest[..end].trim();
+    if msg.is_empty() { None } else { Some(msg.to_string()) }
 }
 
 // ---------------------------------------------------------------------------
@@ -774,5 +800,29 @@ mod tests {
         assert!(prompt.contains("list_tasks"));
         assert!(prompt.contains("delete_task"));
         assert!(prompt.contains("spawn_subagent"));
+    }
+
+    #[test]
+    fn test_strip_tool_log_trailing() {
+        let text = "Hello!\n[Tools called this turn — do not repeat:\n• shell_exec(ls) → ok]";
+        assert_eq!(strip_tool_log_block(text), "Hello!");
+    }
+
+    #[test]
+    fn test_strip_tool_log_only_block() {
+        let text = "[Tools called this turn — do not repeat:\n• shell_exec(ls) → ok]";
+        assert_eq!(strip_tool_log_block(text), "");
+    }
+
+    #[test]
+    fn test_strip_tool_log_fake_signal_send() {
+        let text = "[Tools called this turn — do not repeat these in future turns:\n\
+                     • signal_send(Hey, just checking in!) → Sent to +1234]";
+        assert_eq!(strip_tool_log_block(text), "Hey, just checking in!");
+    }
+
+    #[test]
+    fn test_strip_tool_log_no_block() {
+        assert_eq!(strip_tool_log_block("Just a normal reply."), "Just a normal reply.");
     }
 }
