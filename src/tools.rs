@@ -3,6 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
+use tracing::warn;
 
 use crate::claude::{
     ApiMessage, ClaudeRequest, ContentBlock, LlmClient, MessageContent, ToolDefinition,
@@ -1349,6 +1350,17 @@ impl ToolExecutor {
     /// Dispatch spawn_subagent: if SubAgentManager is available, spawn in
     /// background and return immediately. Otherwise fall back to blocking.
     async fn spawn_subagent_dispatch(&self, input: &Value) -> String {
+        // Direct file logging — bypass tracing to guarantee visibility.
+        {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
+                .open("/tmp/flint-subagent-debug.log")
+            {
+                let _ = writeln!(f, "[{}] spawn_subagent_dispatch called, has_mgr={}",
+                    chrono::Utc::now(), self.subagent_mgr.is_some());
+            }
+        }
+        warn!("spawn_subagent_dispatch called, has_mgr={}", self.subagent_mgr.is_some());
         let task = match input["task"].as_str() {
             Some(t) => t,
             None => return "Error: missing 'task' field".to_string(),
@@ -1374,6 +1386,7 @@ impl ToolExecutor {
 
         // Background path: use SubAgentManager.
         if let Some(mgr) = &self.subagent_mgr {
+            warn!("spawn_subagent_dispatch: calling mgr.spawn() for task: {}", trunc(task, 60));
             let id = mgr.spawn(
                 task.to_string(),
                 context,
@@ -1387,6 +1400,7 @@ impl ToolExecutor {
                 None,
                 None, // plan_result_tx: not a plan step
             ).await;
+            warn!("spawn_subagent_dispatch: mgr.spawn() returned id={id}");
             let task_preview = trunc(task, 120);
             return serde_json::json!({
                 "sub_agent_id": id,
@@ -1395,6 +1409,7 @@ impl ToolExecutor {
             }).to_string();
         }
 
+        warn!("spawn_subagent_dispatch: no SubAgentManager, falling back to blocking");
         // Blocking fallback (no SubAgentManager — e.g. task runners).
         self.spawn_subagent_blocking(task, &context, skill.as_ref()).await
     }

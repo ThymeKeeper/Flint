@@ -1,3 +1,5 @@
+use serde::{Serialize, Deserialize};
+
 use crate::config::ClaudeConfig;
 
 // ---------------------------------------------------------------------------
@@ -19,11 +21,54 @@ impl Role {
     }
 }
 
+/// Content of an API message: either a plain string or a list of typed blocks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MessageContent {
+    Text(String),
+    Blocks(Vec<ContentBlock>),
+}
+
+/// A typed content block used in outgoing messages and tool loop messages.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentBlock {
+    Text {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct Message {
     pub role: Role,
-    pub content: String,
+    pub content: MessageContent,
     pub token_estimate: usize,
+}
+
+impl Message {
+    /// Extract text content, ignoring tool blocks.
+    pub fn text_content(&self) -> String {
+        match &self.content {
+            MessageContent::Text(s) => s.clone(),
+            MessageContent::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -45,13 +90,24 @@ impl ConversationContext {
         }
     }
 
-    /// Push a new message to the conversation.
+    /// Push a new plain-text message to the conversation.
     pub fn push(&mut self, role: Role, content: String) {
         let token_estimate = estimate_tokens(&content);
         self.total_tokens += token_estimate;
         self.messages.push(Message {
             role,
-            content,
+            content: MessageContent::Text(content),
+            token_estimate,
+        });
+    }
+
+    /// Push a structured message with content blocks (tool_use / tool_result).
+    pub fn push_blocks(&mut self, role: Role, blocks: Vec<ContentBlock>) {
+        let token_estimate = estimate_tokens_blocks(&blocks);
+        self.total_tokens += token_estimate;
+        self.messages.push(Message {
+            role,
+            content: MessageContent::Blocks(blocks),
             token_estimate,
         });
     }
@@ -98,7 +154,7 @@ impl ConversationContext {
             0,
             Message {
                 role: Role::User,
-                content: summary,
+                content: MessageContent::Text(summary),
                 token_estimate,
             },
         );
@@ -128,6 +184,21 @@ impl ConversationContext {
 /// Rough token estimation: 1 token per 4 characters, minimum 1 token.
 pub fn estimate_tokens(s: &str) -> usize {
     (s.len() / 4).max(1)
+}
+
+/// Token estimation for structured content blocks.
+fn estimate_tokens_blocks(blocks: &[ContentBlock]) -> usize {
+    blocks
+        .iter()
+        .map(|b| match b {
+            ContentBlock::Text { text } => estimate_tokens(text),
+            ContentBlock::ToolUse { input, name, .. } => {
+                estimate_tokens(name) + estimate_tokens(&input.to_string())
+            }
+            ContentBlock::ToolResult { content, .. } => estimate_tokens(content),
+        })
+        .sum::<usize>()
+        .max(1)
 }
 
 // ---------------------------------------------------------------------------
@@ -212,10 +283,10 @@ mod tests {
         // 4 messages -> split at 2 -> oldest = 2 messages, remaining = 2 messages
         assert_eq!(oldest.len(), 2);
         assert_eq!(ctx.len(), 2);
-        assert_eq!(oldest[0].content, "msg 1");
-        assert_eq!(oldest[1].content, "resp 1");
-        assert_eq!(ctx.messages()[0].content, "msg 2");
-        assert_eq!(ctx.messages()[1].content, "resp 2");
+        assert_eq!(oldest[0].text_content(), "msg 1");
+        assert_eq!(oldest[1].text_content(), "resp 1");
+        assert_eq!(ctx.messages()[0].text_content(), "msg 2");
+        assert_eq!(ctx.messages()[1].text_content(), "resp 2");
     }
 
     #[test]
@@ -262,8 +333,8 @@ mod tests {
         ctx.prepend_summary("[Compacted: summary here]".to_string());
 
         assert_eq!(ctx.len(), 2);
-        assert_eq!(ctx.messages()[0].content, "[Compacted: summary here]");
-        assert_eq!(ctx.messages()[1].content, "current message");
+        assert_eq!(ctx.messages()[0].text_content(), "[Compacted: summary here]");
+        assert_eq!(ctx.messages()[1].text_content(), "current message");
         assert!(ctx.total_tokens() > tokens_before);
     }
 

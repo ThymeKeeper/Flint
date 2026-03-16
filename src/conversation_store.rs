@@ -3,6 +3,8 @@ use duckdb::Connection;
 use std::sync::{Arc, Mutex};
 use tracing::debug;
 
+use crate::context::ContentBlock;
+
 // ---------------------------------------------------------------------------
 // ToolLogEntry — one tool call persisted alongside an assistant turn
 // ---------------------------------------------------------------------------
@@ -36,6 +38,8 @@ pub struct StoredTurn {
     pub channel: String,
     /// Structured tool log for assistant turns (empty for user turns and pre-migration rows)
     pub tool_log: Vec<ToolLogEntry>,
+    /// Structured content blocks for tool_use/tool_result messages (None for plain text turns)
+    pub content_blocks: Option<Vec<ContentBlock>>,
 }
 
 impl ConversationStore {
@@ -83,6 +87,20 @@ impl ConversationStore {
                     "ALTER TABLE conversation_turns ADD COLUMN tool_log VARCHAR;",
                 )?;
             }
+            // Migration: add content_blocks column for structured tool_use/tool_result messages.
+            let has_content_blocks: bool = {
+                let mut stmt = conn.prepare(
+                    "SELECT COUNT(*) FROM information_schema.columns \
+                     WHERE table_name = 'conversation_turns' AND column_name = 'content_blocks'",
+                )?;
+                let count: i64 = stmt.query_row([], |row| row.get(0))?;
+                count > 0
+            };
+            if !has_content_blocks {
+                conn.execute_batch(
+                    "ALTER TABLE conversation_turns ADD COLUMN content_blocks VARCHAR;",
+                )?;
+            }
         }
         Ok(Self { db })
     }
@@ -97,6 +115,7 @@ impl ConversationStore {
         content: &str,
         channel: &str,
         tool_log: &[ToolLogEntry],
+        content_blocks: Option<&[ContentBlock]>,
     ) -> Result<()> {
         let ts = chrono::Utc::now().timestamp_millis();
         let tool_log_json = if tool_log.is_empty() {
@@ -104,12 +123,13 @@ impl ConversationStore {
         } else {
             serde_json::to_string(tool_log).ok()
         };
+        let blocks_json = content_blocks.and_then(|b| serde_json::to_string(b).ok());
         let conn = self.db.lock().unwrap();
         conn.execute(
             "INSERT INTO conversation_turns \
-             (session_id, sender, role, content, timestamp_ms, channel, tool_log) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
-            duckdb::params![session_id, sender, role, content, ts, channel, tool_log_json],
+             (session_id, sender, role, content, timestamp_ms, channel, tool_log, content_blocks) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            duckdb::params![session_id, sender, role, content, ts, channel, tool_log_json, blocks_json],
         )?;
         debug!("Stored {role} turn for session {session_id} via {channel}");
         Ok(())
@@ -119,7 +139,7 @@ impl ConversationStore {
     pub fn load_recent(&self, session_id: &str, limit: usize) -> Result<Vec<StoredTurn>> {
         let conn = self.db.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT session_id, sender, role, content, timestamp_ms, COALESCE(channel, 'tui'), tool_log
+            "SELECT session_id, sender, role, content, timestamp_ms, COALESCE(channel, 'tui'), tool_log, content_blocks
              FROM conversation_turns
              WHERE session_id = ?
              ORDER BY timestamp_ms DESC
@@ -128,6 +148,7 @@ impl ConversationStore {
         let mut turns: Vec<StoredTurn> = stmt
             .query_map(duckdb::params![session_id, limit as i64], |row| {
                 let tool_log_json: Option<String> = row.get(6)?;
+                let blocks_json: Option<String> = row.get(7)?;
                 Ok(StoredTurn {
                     session_id:   row.get(0)?,
                     sender:       row.get(1)?,
@@ -138,6 +159,8 @@ impl ConversationStore {
                     tool_log: tool_log_json
                         .and_then(|j| serde_json::from_str(&j).ok())
                         .unwrap_or_default(),
+                    content_blocks: blocks_json
+                        .and_then(|j| serde_json::from_str(&j).ok()),
                 })
             })?
             .collect::<duckdb::Result<Vec<_>>>()?;

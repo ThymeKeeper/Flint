@@ -627,6 +627,14 @@ impl SignalClient for TuiSignalClient {
     }
 }
 
+impl TuiSignalClient {
+    /// Create a streaming agent placeholder in the TUI without a "System" message.
+    /// Used for sub-agent completions where the agent synthesises the result.
+    pub fn push_agent_placeholder(&self) {
+        let _ = self.agent_update_tx.try_send(crate::tui::AgentUpdate::AgentPlaceholder);
+    }
+}
+
 impl AgentObserver for TuiSignalClient {
     fn on_text_chunk(&self, chunk: String) {
         let _ = self.agent_update_tx.try_send(crate::tui::AgentUpdate::StreamChunk(chunk));

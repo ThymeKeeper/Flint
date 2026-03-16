@@ -61,15 +61,20 @@ impl Agent {
         let mut context = ConversationContext::new(config.claude.clone());
         for turn in &history {
             let role = if turn.role == "assistant" { Role::Assistant } else { Role::User };
-            // Prefix Signal user turns so the agent knows which channel they came from.
-            // For assistant turns, rebuild the tool log block so the LLM retains memory
-            // of what tools were called in prior turns.
-            let content = match (turn.role.as_str(), turn.channel.as_str()) {
-                ("user", "signal") => format!("[Signal] {}", turn.content),
-                ("assistant", _)   => rebuild_stored_for_context(&turn.content, &turn.tool_log),
-                _                  => turn.content.clone(),
-            };
-            context.push(role, content);
+            // If the turn has structured content blocks, restore them directly.
+            if let Some(ref blocks) = turn.content_blocks {
+                context.push_blocks(role, blocks.clone());
+            } else {
+                // Legacy plain text: prefix Signal user turns so the agent knows
+                // which channel they came from. Strip any "[Tools called this turn...]"
+                // blocks from assistant turns.
+                let content = match (turn.role.as_str(), turn.channel.as_str()) {
+                    ("user", "signal") => format!("[Signal] {}", turn.content),
+                    ("assistant", _)   => strip_tool_log_block(&turn.content),
+                    _                  => turn.content.clone(),
+                };
+                context.push(role, content);
+            }
         }
         Self { soul, llm, utility_llm, memory, tasks, skills, jobs, subagent_mgr, conv_store, context: RwLock::new(context), config, signal_client, code_index }
     }
@@ -137,7 +142,7 @@ impl Agent {
             let mut ctx = self.context.write().await;
             ctx.push(Role::User, ctx_text);
         }
-        if let Err(e) = self.conv_store.push("default", sender, "user", text, channel, &[]) {
+        if let Err(e) = self.conv_store.push("default", sender, "user", text, channel, &[], None) {
             warn!("Failed to persist user turn: {e:#}");
         }
 
@@ -151,6 +156,7 @@ impl Agent {
             ClaudeClient::messages_from_context(&ctx)
         };
         let mut tool_log: Vec<ToolLogEntry> = Vec::new();
+        let mut intermediate_turns: Vec<(Role, Vec<ContentBlock>)> = Vec::new();
         let final_text = loop {
             let req = ClaudeRequest {
                 system: &system_prompt,
@@ -194,6 +200,7 @@ impl Agent {
             }
 
             // Assistant turn: full blocks (text + tool_use)
+            intermediate_turns.push((Role::Assistant, resp.raw_blocks.clone()));
             messages.push(ApiMessage {
                 role: "assistant".to_string(),
                 content: MessageContent::Blocks(resp.raw_blocks),
@@ -213,23 +220,50 @@ impl Agent {
             }
 
             // User turn: tool results
+            intermediate_turns.push((Role::User, results.clone()));
             messages.push(ApiMessage {
                 role: "user".to_string(),
                 content: MessageContent::Blocks(results),
             });
         };
 
-        // 6. Push assistant reply + tool log block to in-memory context (for LLM continuity).
-        //    Persist reply_text and structured tool_log separately to the DB.
+        // 6. Push assistant reply to in-memory context (for LLM continuity).
+        //    Strip any hallucinated "[Tools called this turn...]" blocks that the
+        //    model may have generated as text — these cause a self-reinforcing loop
+        //    where the model mimics tool calls textually instead of using tool_use.
+        let clean_text = strip_tool_log_block(&final_text);
         {
             let mut ctx = self.context.write().await;
-            let stored = rebuild_stored_for_context(&final_text, &tool_log);
-            ctx.push(Role::Assistant, stored);
-            if let Err(e) = self.conv_store.push(
-                "default", "assistant", "assistant", &final_text, channel, &tool_log,
-            ) {
-                warn!("Failed to persist assistant turn: {e:#}");
+            // Store intermediate tool loop turns (structured tool_use/tool_result)
+            for (role, blocks) in &intermediate_turns {
+                ctx.push_blocks(role.clone(), blocks.clone());
             }
+            ctx.push(Role::Assistant, clean_text.clone());
+        }
+
+        // Persist intermediate tool loop turns to DB
+        for (role, blocks) in &intermediate_turns {
+            let role_str = role.as_str();
+            let text_summary = blocks
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let sender = if role_str == "user" { "system" } else { "assistant" };
+            if let Err(e) = self.conv_store.push(
+                "default", sender, role_str, &text_summary, channel, &[], Some(blocks),
+            ) {
+                warn!("Failed to persist intermediate tool turn: {e:#}");
+            }
+        }
+        // Persist final assistant text
+        if let Err(e) = self.conv_store.push(
+            "default", "assistant", "assistant", &clean_text, channel, &tool_log, None,
+        ) {
+            warn!("Failed to persist assistant turn: {e:#}");
         }
 
         // 7. Fire-and-forget: post-conversation memory tasks
@@ -237,7 +271,7 @@ impl Agent {
         //    Uses the cheap utility model (Haiku) instead of the main model.
         let memory_mgr = self.memory.clone();
         let llm = self.utility_llm.clone();
-        let exchange_text = format!("User: {text}\nAssistant: {final_text}");
+        let exchange_text = format!("User: {text}\nAssistant: {clean_text}");
         let id_sims = mem_id_sims.clone();
         let channel_owned = channel.to_string();
         tokio::spawn(async move {
@@ -252,8 +286,8 @@ impl Agent {
             }
         });
 
-        info!("Response generated: {} chars", final_text.len());
-        Ok(AgentResponse { reply_text: final_text, tool_log })
+        info!("Response generated: {} chars", clean_text.len());
+        Ok(AgentResponse { reply_text: clean_text, tool_log })
     }
 
     /// Build the system prompt from soul + retrieved memories + date + tool guidelines.
@@ -447,7 +481,7 @@ impl Agent {
 
         let old_text: String = oldest
             .iter()
-            .map(|m| format!("{}: {}", m.role.as_str(), m.content))
+            .map(|m| format!("{}: {}", m.role.as_str(), m.text_content()))
             .collect::<Vec<_>>()
             .join("\n\n");
 
@@ -797,29 +831,10 @@ fn make_tool_log_entry(name: &str, input: &serde_json::Value, result: &str) -> T
     ToolLogEntry { name: name.to_string(), summary, result: result_line }
 }
 
-/// Reconstruct the full assistant context block from clean reply text + structured tool log.
-/// This is what goes into the in-memory ConversationContext so the LLM remembers tool calls.
-fn rebuild_stored_for_context(content: &str, tool_log: &[ToolLogEntry]) -> String {
-    if tool_log.is_empty() {
-        return content.to_string();
-    }
-    let log_lines = tool_log
-        .iter()
-        .map(|e| {
-            if e.summary.is_empty() {
-                format!("• {}() → {}", e.name, e.result)
-            } else {
-                format!("• {}({}) → {}", e.name, e.summary, e.result)
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    if content.is_empty() {
-        format!("[Tools called this turn — do not repeat these in future turns:\n{log_lines}]")
-    } else {
-        format!("{content}\n\n[Tools called this turn — do not repeat these in future turns:\n{log_lines}]")
-    }
-}
+// rebuild_stored_for_context was removed — including tool log text in the
+// conversation context caused the model to mimic tool calls as text output
+// instead of using the tool_use API.  Tool logs are still persisted to the
+// DB via conv_store.push() for offline inspection.
 
 // ---------------------------------------------------------------------------
 // Tests

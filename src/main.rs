@@ -338,16 +338,15 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // Sub-agent completion — inject result as a synthetic message
+            // Sub-agent completion — agent synthesises and streams the result.
+            // No System message (the agent's summary is all the user needs).
+            // No Signal forwarding (the original request came from TUI).
             Some(notification) = subagent_notify_rx.recv() => {
                 let text = notification.to_agent_text();
-                tui_client.push_notification(text.clone());
+                tui_client.push_agent_placeholder();
                 let obs: Option<Arc<dyn AgentObserver>> =
                     Some(tui_client.clone() as Arc<dyn AgentObserver>);
-                let resp = handle_turn_ret(&agent, &tui_dyn, "system", &config.primary_contact, &text, "tui", obs).await;
-                if let (Some(r), Some(sr)) = (resp, &signal_rest) {
-                    let _ = sr.send(&config.primary_contact, &r.display_text()).await;
-                }
+                handle_turn_ret(&agent, &tui_dyn, "system", &config.primary_contact, &text, "tui", obs).await;
             }
         }
     }
@@ -418,13 +417,10 @@ async fn drain_jobs(
     }
     while let Ok(notification) = subagent_notify_rx.try_recv() {
         let text = notification.to_agent_text();
-        tui.push_notification(text.clone());
+        tui_client.push_agent_placeholder();
         let obs: Option<Arc<dyn AgentObserver>> =
             Some(tui_client.clone() as Arc<dyn AgentObserver>);
-        let resp = handle_turn_ret(agent, tui, "system", primary_contact, &text, "tui", obs).await;
-        if let (Some(r), Some(sr)) = (resp, signal_rest) {
-            let _ = sr.send(primary_contact, &r.display_text()).await;
-        }
+        handle_turn_ret(agent, tui, "system", primary_contact, &text, "tui", obs).await;
     }
 }
 

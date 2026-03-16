@@ -8,6 +8,7 @@ use tracing::{debug, trace};
 
 use crate::config::ClaudeConfig;
 use crate::context::ConversationContext;
+pub use crate::context::{MessageContent, ContentBlock};
 
 // ---------------------------------------------------------------------------
 // Tool definition (here because it's a Claude API type)
@@ -18,36 +19,6 @@ pub struct ToolDefinition {
     pub name:         &'static str,
     pub description:  &'static str,
     pub input_schema: serde_json::Value,
-}
-
-// ---------------------------------------------------------------------------
-// Message content types
-// ---------------------------------------------------------------------------
-
-/// Content of an API message: either a plain string or a list of typed blocks.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum MessageContent {
-    Text(String),
-    Blocks(Vec<ContentBlock>),
-}
-
-/// A typed content block used in outgoing messages and tool loop messages.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ContentBlock {
-    Text {
-        text: String,
-    },
-    ToolUse {
-        id: String,
-        name: String,
-        input: serde_json::Value,
-    },
-    ToolResult {
-        tool_use_id: String,
-        content: String,
-    },
 }
 
 // ---------------------------------------------------------------------------
@@ -177,7 +148,7 @@ impl ClaudeClient {
             .iter()
             .map(|m| ApiMessage {
                 role: m.role.as_str().to_string(),
-                content: MessageContent::Text(m.content.clone()),
+                content: m.content.clone(),
             })
             .collect()
     }

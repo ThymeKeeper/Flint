@@ -63,6 +63,9 @@ pub enum AgentUpdate {
     SubAgentToolEvent { id: u64, text: String },
     /// Sub-agent completed — remove its activity box.
     SubAgentCompleted { id: u64, result_summary: String },
+    /// Add a streaming agent placeholder without a "System" message.
+    /// Used when the agent will synthesise a result (e.g. sub-agent completion).
+    AgentPlaceholder,
 }
 
 /// Channel endpoints owned by `TuiSignalClient`.
@@ -198,6 +201,16 @@ pub fn run_tui(
                     if auto_scroll {
                         scroll_up = 0;
                     }
+                }
+                Ok(AgentUpdate::AgentPlaceholder) => {
+                    // Streaming placeholder only — no System message.
+                    messages.push(ChatMessage {
+                        role: agent_name.clone(),
+                        text: String::new(),
+                        streaming: true,
+                    });
+                    auto_scroll = true;
+                    scroll_up = 0;
                 }
                 Ok(AgentUpdate::JobNotification(text)) => {
                     // Show the job completion as a System message, then add an

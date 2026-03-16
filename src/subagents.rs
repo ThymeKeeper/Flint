@@ -16,7 +16,7 @@ use std::time::Instant;
 use serde::Deserialize;
 use tokio::sync::{mpsc, RwLock};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::warn;
 
 use crate::claude::{
     ApiMessage, ClaudeRequest, ContentBlock, LlmClient, MessageContent, ToolDefinition,
@@ -148,6 +148,15 @@ impl SubAgentManager {
         step_id: Option<String>,
         plan_result_tx: Option<mpsc::Sender<(String, String, bool)>>,
     ) -> u64 {
+        // Direct file logging — bypass tracing.
+        {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
+                .open("/tmp/flint-subagent-debug.log")
+            {
+                let _ = writeln!(f, "[{}] SubAgentManager::spawn() called, task={}", chrono::Utc::now(), trunc(&task, 60));
+            }
+        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let skill_name = skill.as_ref().map(|s| s.name.clone());
 
@@ -175,17 +184,31 @@ impl SubAgentManager {
             Some(name) => format!("{name}: {}", trunc(&task, 50)),
             None => trunc(&task, 60),
         };
-        let _ = self.tui_tx.send(AgentUpdate::SubAgentStarted {
+        match self.tui_tx.send(AgentUpdate::SubAgentStarted {
             id,
-            task: label,
-        }).await;
+            task: label.clone(),
+        }).await {
+            Ok(()) => warn!("Sub-agent {id}: SubAgentStarted sent to TUI ({label})"),
+            Err(e) => warn!("Sub-agent {id}: FAILED to send SubAgentStarted to TUI: {e}"),
+        }
 
         let notify_tx = self.notify_tx.clone();
         let tui_tx = self.tui_tx.clone();
         let active = self.active.clone();
         let task_clone = task.clone();
+        let skill_name_clone = skill_name.clone();
+        let step_id_clone = step_id.clone();
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
+            {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
+                    .open("/tmp/flint-subagent-debug.log")
+                {
+                    let _ = writeln!(f, "[{}] Sub-agent {id} tokio task STARTED", chrono::Utc::now());
+                }
+            }
+            warn!("Sub-agent {id} task started");
             let observer = Arc::new(SubAgentObserver { id, tui_tx: tui_tx.clone() });
             let result = run_subagent_loop(
                 &task_clone,
@@ -201,9 +224,15 @@ impl SubAgentManager {
             )
             .await;
 
-            let (result_text, is_error) = match result {
-                Ok(text) => (text, false),
-                Err(e) => (format!("{e:#}"), true),
+            let (result_text, is_error) = match &result {
+                Ok(text) => {
+                    warn!("Sub-agent {id} loop completed successfully ({} chars)", text.len());
+                    (text.clone(), false)
+                }
+                Err(e) => {
+                    warn!("Sub-agent {id} loop failed: {e:#}");
+                    (format!("{e:#}"), true)
+                }
             };
 
             // Read skill/plan_id/step_id from active before removing.
@@ -233,13 +262,15 @@ impl SubAgentManager {
 
             // Notify TUI of completion.
             let summary = trunc(&result_text, 120);
-            let _ = tui_tx.send(AgentUpdate::SubAgentCompleted {
+            if let Err(e) = tui_tx.send(AgentUpdate::SubAgentCompleted {
                 id,
                 result_summary: summary,
-            }).await;
+            }).await {
+                warn!("Sub-agent {id}: failed to send SubAgentCompleted to TUI: {e}");
+            }
 
             // Notify main event loop.
-            let _ = notify_tx.send(SubAgentNotification {
+            if let Err(e) = notify_tx.send(SubAgentNotification {
                 id,
                 task: task_clone,
                 result: result_text,
@@ -247,12 +278,57 @@ impl SubAgentManager {
                 skill: skill_out,
                 plan_id: plan_id_out,
                 step_id: step_id_out,
-            }).await;
+            }).await {
+                warn!("Sub-agent {id}: failed to send notification to main loop: {e}");
+            }
 
-            debug!("Sub-agent {id} finished (error={is_error})");
+            warn!("Sub-agent {id} finished (error={is_error})");
         });
 
-        info!("Sub-agent {id} spawned: {}", trunc(&task, 60));
+        // Monitor the JoinHandle — if the spawned task panics, we still need
+        // to clean up the active map and notify the TUI + main loop.
+        {
+            let active = self.active.clone();
+            let tui_tx = self.tui_tx.clone();
+            let notify_tx = self.notify_tx.clone();
+            let task_for_panic = task.clone();
+            let skill_for_panic = skill_name_clone;
+            let step_id_for_panic = step_id_clone;
+            tokio::spawn(async move {
+                if let Err(join_err) = handle.await {
+                    // The task panicked or was cancelled.
+                    let panic_msg = if join_err.is_panic() {
+                        format!("Sub-agent {id} PANICKED: {join_err}")
+                    } else {
+                        format!("Sub-agent {id} was cancelled: {join_err}")
+                    };
+                    warn!("{panic_msg}");
+
+                    // Clean up active map.
+                    { active.write().await.remove(&id); }
+
+                    // Notify TUI so the box is removed.
+                    let _ = tui_tx.send(AgentUpdate::SubAgentCompleted {
+                        id,
+                        result_summary: panic_msg.clone(),
+                    }).await;
+
+                    // Notify main loop so the agent can report the failure.
+                    let _ = notify_tx.send(SubAgentNotification {
+                        id,
+                        task: task_for_panic,
+                        result: panic_msg,
+                        is_error: true,
+                        skill: skill_for_panic,
+                        plan_id,
+                        step_id: step_id_for_panic,
+                    }).await;
+                }
+                // If Ok(_), the task completed normally and already sent notifications.
+            });
+        }
+
+        warn!("Sub-agent {id} spawned: {}", trunc(&task, 60));
         id
     }
 
@@ -324,23 +400,42 @@ struct SubAgentObserver {
 
 impl AgentObserver for SubAgentObserver {
     fn on_text_chunk(&self, chunk: String) {
-        let _ = self.tui_tx.try_send(AgentUpdate::SubAgentChunk {
-            id: self.id,
-            chunk,
+        let tui_tx = self.tui_tx.clone();
+        let id = self.id;
+        tokio::spawn(async move {
+            if let Err(e) = tui_tx.send(AgentUpdate::SubAgentChunk {
+                id,
+                chunk,
+            }).await {
+                warn!("Failed to send SubAgentChunk for sub-agent {id}: {e}");
+            }
         });
     }
 
     fn on_tool_start(&self, name: &str) {
-        let _ = self.tui_tx.try_send(AgentUpdate::SubAgentToolEvent {
-            id: self.id,
-            text: format!("⚙ {name}"),
+        let tui_tx = self.tui_tx.clone();
+        let id = self.id;
+        let text = format!("⚙ {name}");
+        tokio::spawn(async move {
+            if let Err(e) = tui_tx.send(AgentUpdate::SubAgentToolEvent {
+                id,
+                text,
+            }).await {
+                warn!("Failed to send SubAgentToolEvent (tool start) for sub-agent {id}: {e}");
+            }
         });
     }
 
     fn on_tool_event(&self, text: String) {
-        let _ = self.tui_tx.try_send(AgentUpdate::SubAgentToolEvent {
-            id: self.id,
-            text,
+        let tui_tx = self.tui_tx.clone();
+        let id = self.id;
+        tokio::spawn(async move {
+            if let Err(e) = tui_tx.send(AgentUpdate::SubAgentToolEvent {
+                id,
+                text,
+            }).await {
+                warn!("Failed to send SubAgentToolEvent for sub-agent {id}: {e}");
+            }
         });
     }
 }
@@ -567,7 +662,7 @@ impl SubAgentManager {
 
                 // Check if all steps are done.
                 if results.len() == steps_arc.len() {
-                    info!("Plan {plan_id}: all {step_count} steps completed");
+                    warn!("Plan {plan_id}: all {step_count} steps completed");
                     break;
                 }
 
