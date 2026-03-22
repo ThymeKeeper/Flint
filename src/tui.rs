@@ -29,7 +29,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Padding, Paragraph},
     Terminal,
 };
 use tokio::sync::mpsc;
@@ -318,7 +318,7 @@ pub fn run_tui(
         } else {
             Style::default()
         };
-        textarea.set_block(Block::default().borders(Borders::ALL).title(input_title.clone()));
+        textarea.set_block(Block::default().borders(Borders::TOP | Borders::BOTTOM).padding(Padding::horizontal(1)).title(input_title.clone()));
         textarea.set_style(input_style);
 
         // ── Draw ─────────────────────────────────────────────────────────────
@@ -453,7 +453,8 @@ pub fn run_tui(
 
                 let chat_title = format!(" {} ", agent_name);
                 let chat_block = Block::default()
-                    .borders(Borders::ALL)
+                    .borders(Borders::TOP | Borders::BOTTOM)
+                    .padding(Padding::horizontal(1))
                     .title(chat_title);
                 // No .wrap() — lines are already pre-wrapped.
                 let chat_para =
@@ -765,7 +766,8 @@ fn render_subagent_panel(
             .collect();
 
         let block = Block::default()
-            .borders(Borders::ALL)
+            .borders(Borders::TOP | Borders::BOTTOM)
+            .padding(Padding::horizontal(1))
             .border_style(Style::default().fg(Color::Yellow))
             .title(Span::styled(title, Style::default().fg(Color::Yellow)));
 
@@ -808,7 +810,7 @@ fn trunc_str(s: &str, max: usize) -> String {
 
 fn make_textarea<'a>() -> TextArea<'a> {
     let mut ta = TextArea::default();
-    ta.set_block(Block::default().borders(Borders::ALL).title(" You "));
+    ta.set_block(Block::default().borders(Borders::TOP | Borders::BOTTOM).padding(Padding::horizontal(1)).title(" You "));
     ta.set_cursor_line_style(Style::default()); // no background on cursor row
     ta
 }
