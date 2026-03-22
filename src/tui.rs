@@ -113,6 +113,13 @@ struct SubAgentBox {
 const MAX_SA_BOX_CHARS: usize = 2000;
 const MAX_VISIBLE_SA_BOXES: usize = 4;
 
+// ── Sage palette (from dotfiles/kitty/kitty.conf) ────────────────────────
+const SAGE_GREEN: Color = Color::Rgb(0x8c, 0xb4, 0x96);   // color2  #8cb496
+const SAGE_YELLOW: Color = Color::Rgb(0xc8, 0x96, 0x64);   // color3  #c89664
+const SAGE_BLUE: Color = Color::Rgb(0x5f, 0x9e, 0xa0);     // color4  #5f9ea0
+const SAGE_DIM: Color = Color::Rgb(0x65, 0x65, 0x65);       // color8  #656565
+const SAGE_USER_BG: Color = Color::Rgb(0x28, 0x28, 0x28);   // slightly above bg #1e1e1e
+
 // ---------------------------------------------------------------------------
 // TUI entry point
 // ---------------------------------------------------------------------------
@@ -314,7 +321,7 @@ pub fn run_tui(
             None => " You ".to_string(),
         };
         let input_style = if waiting {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(SAGE_DIM)
         } else {
             Style::default()
         };
@@ -363,7 +370,7 @@ pub fn run_tui(
                 let sa_area = if sa_panel_height > 0 { Some(chunks[1]) } else { None };
                 let input_area = if sa_panel_height > 0 { chunks[2] } else { chunks[1] };
 
-                let inner_width = chat_area.width.saturating_sub(2); // L+R borders
+                let inner_width = chat_area.width.saturating_sub(1); // right padding only
                 let (tagged, tagged_msg_idx) = build_chat_lines(&messages);
                 let (lines, _, _, _) = build_display_lines(&tagged, inner_width);
 
@@ -454,7 +461,7 @@ pub fn run_tui(
                 let chat_title = format!(" {} ", agent_name);
                 let chat_block = Block::default()
                     .borders(Borders::TOP | Borders::BOTTOM)
-                    .padding(Padding::horizontal(1))
+                    .padding(Padding::right(1))
                     .title(chat_title);
                 // No .wrap() — lines are already pre-wrapped.
                 let chat_para =
@@ -761,15 +768,15 @@ fn render_subagent_panel(
             .rev()
             .map(|l| {
                 let display: String = l.chars().take(inner_width).collect();
-                Line::from(Span::styled(display, Style::default().fg(Color::DarkGray)))
+                Line::from(Span::styled(display, Style::default().fg(SAGE_DIM)))
             })
             .collect();
 
         let block = Block::default()
             .borders(Borders::TOP | Borders::BOTTOM)
             .padding(Padding::horizontal(1))
-            .border_style(Style::default().fg(Color::Yellow))
-            .title(Span::styled(title, Style::default().fg(Color::Yellow)));
+            .border_style(Style::default().fg(SAGE_YELLOW))
+            .title(Span::styled(title, Style::default().fg(SAGE_YELLOW)));
 
         let para = Paragraph::new(output_lines).block(block);
         frame.render_widget(para, box_areas[i]);
@@ -853,7 +860,7 @@ fn render_inline_cell(text: &str, base: Style) -> Vec<Span<'static>> {
                     spans.push(Span::styled(std::mem::take(&mut current), base));
                 }
                 let word: String = chars[i + 1..j].iter().collect();
-                spans.push(Span::styled(word, base.fg(Color::Cyan)));
+                spans.push(Span::styled(word, base.fg(SAGE_BLUE)));
                 i = j + 1;
                 continue;
             }
@@ -903,7 +910,7 @@ fn render_inline_spans(line: &str) -> Vec<Span<'static>> {
                     spans.push(Span::raw(std::mem::take(&mut current)));
                 }
                 let text: String = chars[i + 1..j].iter().collect();
-                spans.push(Span::styled(text, Style::default().fg(Color::Cyan)));
+                spans.push(Span::styled(text, Style::default().fg(SAGE_BLUE)));
                 i = j + 1;
                 continue;
             }
@@ -971,7 +978,7 @@ fn flush_table(rows: &[String], result: &mut Vec<(Line<'static>, bool)>) {
             result.push((
                 Line::from(Span::styled(
                     format!("  {}", "─".repeat(rule_width)),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(SAGE_DIM),
                 )),
                 true,
             ));
@@ -1035,7 +1042,7 @@ fn render_markdown(text: &str) -> Vec<(Line<'static>, bool)> {
             };
             // Fence markers are short — normal wrap
             result.push((
-                Line::from(Span::styled(label, Style::default().fg(Color::DarkGray))),
+                Line::from(Span::styled(label, Style::default().fg(SAGE_DIM))),
                 false,
             ));
             continue;
@@ -1046,7 +1053,7 @@ fn render_markdown(text: &str) -> Vec<(Line<'static>, bool)> {
             result.push((
                 Line::from(vec![
                     Span::raw("  "),
-                    Span::styled(raw_line.to_string(), Style::default().fg(Color::Yellow)),
+                    Span::styled(raw_line.to_string(), Style::default().fg(SAGE_YELLOW)),
                 ]),
                 true,
             ));
@@ -1067,7 +1074,7 @@ fn render_markdown(text: &str) -> Vec<(Line<'static>, bool)> {
             result.push((
                 Line::from(Span::styled(
                     format!("  ⚙ {rest}"),
-                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                    Style::default().fg(SAGE_DIM).add_modifier(Modifier::ITALIC),
                 )),
                 false,
             ));
@@ -1077,7 +1084,7 @@ fn render_markdown(text: &str) -> Vec<(Line<'static>, bool)> {
             result.push((
                 Line::from(Span::styled(
                     format!("    ↳ {rest}"),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(SAGE_DIM),
                 )),
                 false,
             ));
@@ -1089,7 +1096,7 @@ fn render_markdown(text: &str) -> Vec<(Line<'static>, bool)> {
             result.push((
                 Line::from(Span::styled(
                     format!("  {rest}"),
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    Style::default().fg(SAGE_YELLOW).add_modifier(Modifier::BOLD),
                 )),
                 false,
             ));
@@ -1097,7 +1104,7 @@ fn render_markdown(text: &str) -> Vec<(Line<'static>, bool)> {
             result.push((
                 Line::from(Span::styled(
                     format!("  {rest}"),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default().fg(SAGE_BLUE).add_modifier(Modifier::BOLD),
                 )),
                 false,
             ));
@@ -1105,7 +1112,7 @@ fn render_markdown(text: &str) -> Vec<(Line<'static>, bool)> {
             result.push((
                 Line::from(Span::styled(
                     format!("  {rest}"),
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                    Style::default().fg(SAGE_GREEN).add_modifier(Modifier::BOLD),
                 )),
                 false,
             ));
@@ -1131,34 +1138,47 @@ fn build_chat_lines(messages: &[ChatMessage]) -> (Vec<(Line<'static>, bool)>, Ve
     for (msg_idx, msg) in messages.iter().enumerate() {
         let is_user = msg.role == "You";
         let is_system = msg.role == "System";
-        let user_bg = Style::default().bg(Color::Rgb(40, 40, 40));
-        let sys_style = Style::default().fg(Color::DarkGray);
+        let user_bg = Style::default().bg(SAGE_USER_BG);
+        let sys_style = Style::default().fg(SAGE_DIM);
+
+        // Circle glyph color for the message-start indicator.
+        let glyph_style = if is_user {
+            Style::default().fg(SAGE_BLUE)
+        } else if is_system {
+            sys_style
+        } else {
+            Style::default().fg(SAGE_GREEN)
+        };
 
         // Collapsed system messages: single line with toggle indicator.
         if is_system && msg.collapsed {
             let preview: String = msg.text.lines().next().unwrap_or("").chars().take(80).collect();
             let line = Line::from(vec![
+                Span::styled("● ", glyph_style),
                 Span::styled("▶ System: ", sys_style),
                 Span::styled(preview, sys_style),
             ]);
             lines.push((line, false));
             line_msg_idx.push(msg_idx);
             // Blank separator.
-            lines.push((Line::from(""), false));
+            lines.push((Line::from(" "), false));
             line_msg_idx.push(msg_idx);
             continue;
         }
 
         // Role label — always wrappable.
         let role_style = if is_user {
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            Style::default().fg(SAGE_BLUE).add_modifier(Modifier::BOLD)
         } else if is_system {
             sys_style
         } else {
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+            Style::default().fg(SAGE_GREEN).add_modifier(Modifier::BOLD)
         };
         let role_prefix = if is_system && !msg.collapsed { "▼ System:" } else { &format!("{}:", msg.role) };
-        let mut role_line = Line::from(Span::styled(role_prefix.to_string(), role_style));
+        let mut role_line = Line::from(vec![
+            Span::styled("● ", glyph_style),
+            Span::styled(role_prefix.to_string(), role_style),
+        ]);
         if is_user { role_line.style = user_bg; }
         lines.push((role_line, false));
         line_msg_idx.push(msg_idx);
@@ -1166,8 +1186,9 @@ fn build_chat_lines(messages: &[ChatMessage]) -> (Vec<(Line<'static>, bool)>, Ve
         if msg.text.is_empty() && msg.streaming {
             // Thinking indicator.
             let mut thinking_line = Line::from(vec![
+                Span::raw(" "),
                 Span::raw("  "),
-                Span::styled("▋", Style::default().fg(Color::Yellow)),
+                Span::styled("▋", Style::default().fg(SAGE_YELLOW)),
             ]);
             if is_user { thinking_line.style = user_bg; }
             lines.push((thinking_line, false));
@@ -1182,14 +1203,16 @@ fn build_chat_lines(messages: &[ChatMessage]) -> (Vec<(Line<'static>, bool)>, Ve
             let mut md_lines = render_markdown(text_content);
             let n = md_lines.len();
             for (i, (line, _)) in md_lines.iter_mut().enumerate() {
+                // Prepend 1-char left margin (occupies the glyph column).
+                line.spans.insert(0, Span::raw(" "));
                 if i + 1 == n && msg.streaming {
-                    line.spans.push(Span::styled("▋", Style::default().fg(Color::Yellow)));
+                    line.spans.push(Span::styled("▋", Style::default().fg(SAGE_YELLOW)));
                 }
                 if is_user {
                     line.style = user_bg;
                 } else if is_system {
                     for span in &mut line.spans {
-                        span.style = span.style.fg(Color::DarkGray);
+                        span.style = span.style.fg(SAGE_DIM);
                     }
                 }
             }
@@ -1201,7 +1224,7 @@ fn build_chat_lines(messages: &[ChatMessage]) -> (Vec<(Line<'static>, bool)>, Ve
         }
 
         // Blank separator between messages.
-        let mut sep = Line::from("");
+        let mut sep = Line::from(" ");
         if is_user { sep.style = user_bg; }
         lines.push((sep, false));
         line_msg_idx.push(msg_idx);
@@ -1401,7 +1424,7 @@ fn apply_selection_highlight(
                 } else {
                     true // middle row — fully selected
                 };
-                (ch, if in_sel { style.bg(Color::DarkGray) } else { style })
+                (ch, if in_sel { style.bg(SAGE_DIM) } else { style })
             })
             .collect();
 
