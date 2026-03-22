@@ -98,6 +98,8 @@ struct ChatMessage {
     role: String,
     text: String,
     streaming: bool,
+    /// System messages start collapsed; toggled by click or keypress.
+    collapsed: bool,
 }
 
 /// State for a live sub-agent activity box in the TUI.
@@ -162,6 +164,8 @@ pub fn run_tui(
     let mut last_chat_area = Rect::default();
     let mut last_inner_width: u16 = 0;
     let mut last_scroll_top: u16 = 0;
+    // Maps display row → message index (for click-to-toggle on system messages).
+    let mut last_row_to_msg: Vec<usize> = Vec::new();
 
     // ── Main loop ─────────────────────────────────────────────────────────────
     loop {
@@ -208,6 +212,7 @@ pub fn run_tui(
                         role: agent_name.clone(),
                         text: String::new(),
                         streaming: true,
+                        collapsed: false,
                     });
                     auto_scroll = true;
                     scroll_up = 0;
@@ -219,11 +224,13 @@ pub fn run_tui(
                         role: "System".to_string(),
                         text,
                         streaming: false,
+                        collapsed: true,
                     });
                     messages.push(ChatMessage {
                         role: agent_name.clone(),
                         text: String::new(),
                         streaming: true,
+                        collapsed: false,
                     });
                     auto_scroll = true;
                     scroll_up = 0;
@@ -233,10 +240,14 @@ pub fn run_tui(
                     // conversation on startup, including Signal exchanges.
                     let mut history_msgs: Vec<ChatMessage> = turns
                         .into_iter()
-                        .map(|(role, content)| ChatMessage {
-                            role,
-                            text: content,
-                            streaming: false,
+                        .map(|(role, content)| {
+                            let is_sys = role == "System";
+                            ChatMessage {
+                                role,
+                                text: content,
+                                streaming: false,
+                                collapsed: is_sys,
+                            }
                         })
                         .collect();
                     history_msgs.append(&mut messages);
@@ -247,10 +258,12 @@ pub fn run_tui(
                 Ok(AgentUpdate::NewTurns(turns)) => {
                     // Append new turns (e.g. from Signal) to the end of the chat.
                     for (role, content) in turns {
+                        let is_sys = role == "System";
                         messages.push(ChatMessage {
                             role,
                             text: content,
                             streaming: false,
+                            collapsed: is_sys,
                         });
                     }
                     if auto_scroll {
@@ -351,8 +364,69 @@ pub fn run_tui(
                 let input_area = if sa_panel_height > 0 { chunks[2] } else { chunks[1] };
 
                 let inner_width = chat_area.width.saturating_sub(2); // L+R borders
-                let tagged = build_chat_lines(&messages);
-                let (lines, _, _, _) = build_display_lines(&tagged, inner_width, h_scroll);
+                let (tagged, tagged_msg_idx) = build_chat_lines(&messages);
+                let (lines, _, _, _) = build_display_lines(&tagged, inner_width);
+
+                // Build display-row → message-index mapping for click handling.
+                // Count how many display rows each tagged line expanded to.
+                {
+                    let mut row_to_msg = Vec::with_capacity(lines.len());
+                    let mut display_idx = 0;
+                    for (tagged_idx, (line, nowrap)) in tagged.iter().enumerate() {
+                        let msg_idx = tagged_msg_idx.get(tagged_idx).copied().unwrap_or(0);
+                        if *nowrap || inner_width == 0 {
+                            // 1:1 mapping
+                            row_to_msg.push(msg_idx);
+                            display_idx += 1;
+                        } else {
+                            let chars = line_to_chars(line);
+                            let n_rows = if chars.is_empty() {
+                                1
+                            } else {
+                                // Count rows the same way build_display_lines does.
+                                let w = inner_width as usize;
+                                let indent_len = chars.iter().take_while(|(c, _)| *c == ' ').count();
+                                let mut s = 0;
+                                let mut rows = 0;
+                                let mut first = true;
+                                while s < chars.len() {
+                                    let avail = if first { w } else { w.saturating_sub(indent_len).max(1) };
+                                    let hard_end = (s + avail).min(chars.len());
+                                    let end = if hard_end < chars.len() {
+                                        let mut brk = hard_end;
+                                        while brk > s && chars[brk - 1].0 != ' ' { brk -= 1; }
+                                        if brk == s { hard_end } else { brk }
+                                    } else { hard_end };
+                                    rows += 1;
+                                    s = end;
+                                    if s < chars.len() && chars[s].0 == ' ' { s += 1; }
+                                    first = false;
+                                }
+                                rows
+                            };
+                            for _ in 0..n_rows {
+                                row_to_msg.push(msg_idx);
+                            }
+                            display_idx += n_rows;
+                        }
+                    }
+                    last_row_to_msg = row_to_msg;
+                }
+
+                // Pad lines that have a background color to fill the full width,
+                // so the background extends across the entire row.
+                let lines: Vec<Line<'static>> = lines.into_iter().map(|mut line| {
+                    if line.style.bg.is_some() {
+                        let content_width: usize = line.spans.iter()
+                            .map(|s| s.content.chars().count())
+                            .sum();
+                        let pad = (inner_width as usize).saturating_sub(content_width);
+                        if pad > 0 {
+                            line.spans.push(Span::styled(" ".repeat(pad), line.style));
+                        }
+                    }
+                    line
+                }).collect();
 
                 let total_rendered_rows = lines.len() as u16;
                 let visible = chat_area.height.saturating_sub(2); // T+B borders
@@ -377,17 +451,13 @@ pub fn run_tui(
                     _ => lines,
                 };
 
-                let chat_title = if h_scroll > 0 {
-                    format!(" {}  +{h_scroll}→ ", agent_name)
-                } else {
-                    format!(" {} ", agent_name)
-                };
+                let chat_title = format!(" {} ", agent_name);
                 let chat_block = Block::default()
                     .borders(Borders::ALL)
                     .title(chat_title);
                 // No .wrap() — lines are already pre-wrapped.
                 let chat_para =
-                    Paragraph::new(lines).block(chat_block).scroll((scroll_top, 0));
+                    Paragraph::new(lines).block(chat_block).scroll((scroll_top, h_scroll as u16));
                 frame.render_widget(chat_para, chat_area);
 
                 // ── Sub-agent activity panel ──────────────────────────────────
@@ -463,12 +533,14 @@ pub fn run_tui(
                                 role: "You".to_string(),
                                 text: text.clone(),
                                 streaming: false,
+                                collapsed: false,
                             });
                             // Placeholder for the agent response.
                             messages.push(ChatMessage {
                                 role: agent_name.clone(),
                                 text: String::new(),
                                 streaming: true,
+                                collapsed: false,
                             });
                             user_input_tx.blocking_send(text).ok();
                             textarea = make_textarea();
@@ -550,6 +622,19 @@ pub fn run_tui(
                     if in_chat_content(mouse.column, mouse.row, last_chat_area) {
                         let row = content_row(mouse.row, last_chat_area, last_scroll_top);
                         let col = content_col(mouse.column, last_chat_area);
+
+                        // Check if clicking on a system message toggle.
+                        let row_idx = row as usize;
+                        if let Some(&msg_idx) = last_row_to_msg.get(row_idx) {
+                            if messages[msg_idx].role == "System" {
+                                messages[msg_idx].collapsed = !messages[msg_idx].collapsed;
+                                sel_start = None;
+                                sel_end = None;
+                                is_selecting = false;
+                                continue;
+                            }
+                        }
+
                         sel_start = Some((row, col));
                         sel_end = Some((row, col));
                         is_selecting = true;
@@ -603,9 +688,9 @@ pub fn run_tui(
                     if let (Some(s), Some(e)) = (sel_start, sel_end) {
                         let (s, e) = if s <= e { (s, e) } else { (e, s) };
                         if s != e {
-                            let tagged = build_chat_lines(&messages);
+                            let (tagged, _) = build_chat_lines(&messages);
                             let (lines, soft_wraps, full_lines, is_nowrap_row) =
-                                build_display_lines(&tagged, last_inner_width, h_scroll);
+                                build_display_lines(&tagged, last_inner_width);
                             let _ = lines; // display lines not needed here
                             let text = extract_selected_text(
                                 &full_lines, &soft_wraps, &is_nowrap_row, s, e,
@@ -730,6 +815,57 @@ fn make_textarea<'a>() -> TextArea<'a> {
 
 /// Parse inline markdown spans: `**bold**` and `` `code` ``.
 /// Returns styled `Span`s with a 2-space leading indent on the first span.
+/// Render inline markdown within a table cell, applying a base style.
+fn render_inline_cell(text: &str, base: Style) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut current = String::new();
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
+
+    while i < n {
+        // **bold**
+        if chars[i] == '*' && i + 1 < n && chars[i + 1] == '*' {
+            let mut j = i + 2;
+            while j + 1 < n && !(chars[j] == '*' && chars[j + 1] == '*') {
+                j += 1;
+            }
+            if j + 1 < n {
+                if !current.is_empty() {
+                    spans.push(Span::styled(std::mem::take(&mut current), base));
+                }
+                let word: String = chars[i + 2..j].iter().collect();
+                spans.push(Span::styled(word, base.add_modifier(Modifier::BOLD)));
+                i = j + 2;
+                continue;
+            }
+        }
+        // `inline code`
+        if chars[i] == '`' {
+            let mut j = i + 1;
+            while j < n && chars[j] != '`' {
+                j += 1;
+            }
+            if j < n {
+                if !current.is_empty() {
+                    spans.push(Span::styled(std::mem::take(&mut current), base));
+                }
+                let word: String = chars[i + 1..j].iter().collect();
+                spans.push(Span::styled(word, base.fg(Color::Cyan)));
+                i = j + 1;
+                continue;
+            }
+        }
+        current.push(chars[i]);
+        i += 1;
+    }
+
+    if !current.is_empty() {
+        spans.push(Span::styled(current, base));
+    }
+    spans
+}
+
 fn render_inline_spans(line: &str) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut current = String::from("  ");
@@ -847,19 +983,27 @@ fn flush_table(rows: &[String], result: &mut Vec<(Line<'static>, bool)>) {
             Style::default()
         };
 
-        let mut row_str = String::from("  ");
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        spans.push(Span::styled("  ", style));
         for (j, &width) in col_widths.iter().enumerate() {
             let cell = cells.get(j).map(|s| s.as_str()).unwrap_or("");
             if j > 0 {
-                row_str.push_str("  ");
+                spans.push(Span::styled("  ", style));
             }
-            row_str.push_str(&format!("{cell:<width$}"));
+            // Strip markdown markers for width calculation (e.g. **bold** → bold)
+            let display_len = cell
+                .replace("**", "")
+                .replace('`', "")
+                .len();
+            let cell_spans = render_inline_cell(cell, style);
+            spans.extend(cell_spans);
+            let pad = width.saturating_sub(display_len);
+            if pad > 0 {
+                spans.push(Span::styled(" ".repeat(pad), style));
+            }
         }
 
-        result.push((
-            Line::from(Span::styled(row_str.trim_end().to_string(), style)),
-            true,
-        ));
+        result.push((Line::from(spans), true));
     }
 }
 
@@ -976,25 +1120,46 @@ fn render_markdown(text: &str) -> Vec<(Line<'static>, bool)> {
     result
 }
 
-fn build_chat_lines(messages: &[ChatMessage]) -> Vec<(Line<'static>, bool)> {
+/// Returns (tagged_lines, line_to_msg_index) where line_to_msg_index[i] is the
+/// index into `messages` that produced tagged line i.
+fn build_chat_lines(messages: &[ChatMessage]) -> (Vec<(Line<'static>, bool)>, Vec<usize>) {
     let mut lines: Vec<(Line<'static>, bool)> = Vec::new();
+    let mut line_msg_idx: Vec<usize> = Vec::new();
 
-    for msg in messages {
+    for (msg_idx, msg) in messages.iter().enumerate() {
         let is_user = msg.role == "You";
         let is_system = msg.role == "System";
         let user_bg = Style::default().bg(Color::Rgb(40, 40, 40));
+        let sys_style = Style::default().fg(Color::DarkGray);
+
+        // Collapsed system messages: single line with toggle indicator.
+        if is_system && msg.collapsed {
+            let preview: String = msg.text.lines().next().unwrap_or("").chars().take(80).collect();
+            let line = Line::from(vec![
+                Span::styled("▶ System: ", sys_style),
+                Span::styled(preview, sys_style),
+            ]);
+            lines.push((line, false));
+            line_msg_idx.push(msg_idx);
+            // Blank separator.
+            lines.push((Line::from(""), false));
+            line_msg_idx.push(msg_idx);
+            continue;
+        }
 
         // Role label — always wrappable.
         let role_style = if is_user {
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
         } else if is_system {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            sys_style
         } else {
             Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
         };
-        let mut role_line = Line::from(Span::styled(format!("{}:", msg.role), role_style));
+        let role_prefix = if is_system && !msg.collapsed { "▼ System:" } else { &format!("{}:", msg.role) };
+        let mut role_line = Line::from(Span::styled(role_prefix.to_string(), role_style));
         if is_user { role_line.style = user_bg; }
         lines.push((role_line, false));
+        line_msg_idx.push(msg_idx);
 
         if msg.text.is_empty() && msg.streaming {
             // Thinking indicator.
@@ -1004,6 +1169,7 @@ fn build_chat_lines(messages: &[ChatMessage]) -> Vec<(Line<'static>, bool)> {
             ]);
             if is_user { thinking_line.style = user_bg; }
             lines.push((thinking_line, false));
+            line_msg_idx.push(msg_idx);
         } else {
             // Trim trailing newlines on completed messages.
             let text_content = if msg.streaming {
@@ -1017,18 +1183,29 @@ fn build_chat_lines(messages: &[ChatMessage]) -> Vec<(Line<'static>, bool)> {
                 if i + 1 == n && msg.streaming {
                     line.spans.push(Span::styled("▋", Style::default().fg(Color::Yellow)));
                 }
-                if is_user { line.style = user_bg; }
+                if is_user {
+                    line.style = user_bg;
+                } else if is_system {
+                    for span in &mut line.spans {
+                        span.style = span.style.fg(Color::DarkGray);
+                    }
+                }
             }
+            let md_count = md_lines.len();
             lines.extend(md_lines);
+            for _ in 0..md_count {
+                line_msg_idx.push(msg_idx);
+            }
         }
 
         // Blank separator between messages.
         let mut sep = Line::from("");
         if is_user { sep.style = user_bg; }
         lines.push((sep, false));
+        line_msg_idx.push(msg_idx);
     }
 
-    lines
+    (lines, line_msg_idx)
 }
 
 /// Flatten a `Line`'s spans into `(char, Style)` pairs.
@@ -1077,7 +1254,6 @@ fn chars_to_spans(chars: &[(char, Style)]) -> Vec<Span<'static>> {
 fn build_display_lines(
     tagged: &[(Line<'static>, bool)],
     inner_width: u16,
-    h_scroll: usize,
 ) -> (Vec<Line<'static>>, Vec<bool>, Vec<Line<'static>>, Vec<bool>) {
     if inner_width == 0 {
         let lines: Vec<_> = tagged.iter().map(|(l, _)| l.clone()).collect();
@@ -1092,24 +1268,25 @@ fn build_display_lines(
     let mut full_lines = Vec::new();
     let mut is_nowrap_row = Vec::new();
     for (line, nowrap) in tagged {
+        let base_style = line.style;
         let chars = line_to_chars(line);
         if chars.is_empty() {
-            lines.push(Line::from(""));
+            let mut empty = Line::from("");
+            empty.style = base_style;
+            lines.push(empty.clone());
             soft_wraps.push(false);
-            full_lines.push(Line::from(""));
+            full_lines.push(empty);
             is_nowrap_row.push(*nowrap);
             continue;
         }
         if *nowrap {
-            let start = h_scroll.min(chars.len());
-            let end = (start + w).min(chars.len());
-            lines.push(if start < end {
-                Line::from(chars_to_spans(&chars[start..end]))
-            } else {
-                Line::from("")
-            });
+            // Emit full-width line — horizontal scrolling is handled
+            // uniformly by the Paragraph's .scroll() offset.
+            let mut full = Line::from(chars_to_spans(&chars));
+            full.style = base_style;
+            lines.push(full.clone());
             soft_wraps.push(false);
-            full_lines.push(Line::from(chars_to_spans(&chars)));
+            full_lines.push(full);
             is_nowrap_row.push(true);
         } else {
             // Detect the leading indent of this line (spaces at the start)
@@ -1120,41 +1297,47 @@ fn build_display_lines(
             let mut start = 0;
             let mut is_first_chunk = true;
             while start < chars.len() {
+                let avail = if is_first_chunk { w } else { w.saturating_sub(indent_len).max(1) };
+                let hard_end = (start + avail).min(chars.len());
+
+                // Find word boundary: scan backwards from hard_end for a space.
+                let end = if hard_end < chars.len() {
+                    let mut brk = hard_end;
+                    while brk > start && chars[brk - 1].0 != ' ' {
+                        brk -= 1;
+                    }
+                    // If no space found in this chunk, fall back to character break.
+                    if brk == start { hard_end } else { brk }
+                } else {
+                    hard_end
+                };
+
                 if is_first_chunk {
-                    // First chunk: render as-is (already has indent).
-                    let end = (start + w).min(chars.len());
-                    let chunk = Line::from(chars_to_spans(&chars[start..end]));
+                    let mut chunk = Line::from(chars_to_spans(&chars[start..end]));
+                    chunk.style = base_style;
                     lines.push(chunk.clone());
                     soft_wraps.push(end < chars.len());
                     full_lines.push(chunk);
                     is_nowrap_row.push(false);
-                    start = end;
                     is_first_chunk = false;
                 } else {
-                    // Continuation: prepend the same indent, fill remaining width.
-                    let content_w = w.saturating_sub(indent_len);
-                    if content_w == 0 {
-                        // Terminal too narrow for indent — just chunk without it.
-                        let end = (start + w).min(chars.len());
-                        let chunk = Line::from(chars_to_spans(&chars[start..end]));
-                        lines.push(chunk.clone());
-                        soft_wraps.push(end < chars.len());
-                        full_lines.push(chunk);
-                        is_nowrap_row.push(false);
-                        start = end;
-                    } else {
-                        let end = (start + content_w).min(chars.len());
-                        let indent_chars: Vec<(char, Style)> =
-                            std::iter::repeat((' ', indent_style)).take(indent_len).collect();
-                        let mut combined = indent_chars;
-                        combined.extend_from_slice(&chars[start..end]);
-                        let chunk = Line::from(chars_to_spans(&combined));
-                        lines.push(chunk.clone());
-                        soft_wraps.push(end < chars.len());
-                        full_lines.push(chunk);
-                        is_nowrap_row.push(false);
-                        start = end;
-                    }
+                    let indent_chars: Vec<(char, Style)> =
+                        std::iter::repeat((' ', indent_style)).take(indent_len).collect();
+                    let mut combined = indent_chars;
+                    combined.extend_from_slice(&chars[start..end]);
+                    let mut chunk = Line::from(chars_to_spans(&combined));
+                    chunk.style = base_style;
+                    lines.push(chunk.clone());
+                    soft_wraps.push(end < chars.len());
+                    full_lines.push(chunk);
+                    is_nowrap_row.push(false);
+                }
+
+                // Skip trailing space at the break point so the next line
+                // doesn't start with a space.
+                start = end;
+                if start < chars.len() && chars[start].0 == ' ' {
+                    start += 1;
                 }
             }
         }

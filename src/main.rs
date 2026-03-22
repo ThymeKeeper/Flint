@@ -133,7 +133,12 @@ async fn main() -> Result<()> {
     );
 
     // ── Load persisted history ────────────────────────────────────────────────
-    let history = conv_store.load_recent("default", 200).unwrap_or_else(|e| {
+    let history = conv_store.load_recent_filtered(
+        "default",
+        200,
+        config.history.transient_ttl_mins,
+        config.history.tool_noise_ttl_mins,
+    ).unwrap_or_else(|e| {
         warn!("Failed to load conversation history: {e:#}");
         Vec::new()
     });
@@ -157,6 +162,8 @@ async fn main() -> Result<()> {
             .filter_map(|t| {
                 let display_role = if t.role == "assistant" {
                     agent_name.clone()
+                } else if t.sender == "system" {
+                    "System".to_string()
                 } else {
                     "You".to_string()
                 };
@@ -338,12 +345,13 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // Sub-agent completion — agent synthesises and streams the result.
-            // No System message (the agent's summary is all the user needs).
-            // No Signal forwarding (the original request came from TUI).
+            // Sub-agent completion — show notification, then agent presents the result.
+            // push_notification sends JobNotification which the TUI renders as a
+            // System message + agent streaming placeholder, so no separate
+            // push_agent_placeholder() call is needed.
             Some(notification) = subagent_notify_rx.recv() => {
                 let text = notification.to_agent_text();
-                tui_client.push_agent_placeholder();
+                tui_dyn.push_notification(text.clone());
                 let obs: Option<Arc<dyn AgentObserver>> =
                     Some(tui_client.clone() as Arc<dyn AgentObserver>);
                 handle_turn_ret(&agent, &tui_dyn, "system", &config.primary_contact, &text, "tui", obs).await;
@@ -417,7 +425,7 @@ async fn drain_jobs(
     }
     while let Ok(notification) = subagent_notify_rx.try_recv() {
         let text = notification.to_agent_text();
-        tui_client.push_agent_placeholder();
+        tui.push_notification(text.clone());
         let obs: Option<Arc<dyn AgentObserver>> =
             Some(tui_client.clone() as Arc<dyn AgentObserver>);
         handle_turn_ret(agent, tui, "system", primary_contact, &text, "tui", obs).await;

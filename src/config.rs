@@ -35,6 +35,40 @@ pub struct AppConfig {
     /// alongside the TUI so both channels are active simultaneously.
     #[serde(default)]
     pub signal: Option<SignalConfig>,
+    /// Conversation history TTL settings for turn categories.
+    #[serde(default)]
+    pub history: HistoryConfig,
+}
+
+// ---------------------------------------------------------------------------
+// HistoryConfig — TTL settings for conversation turn categories
+// ---------------------------------------------------------------------------
+
+fn default_transient_ttl_mins() -> u64 {
+    30
+}
+
+fn default_tool_noise_ttl_mins() -> u64 {
+    60
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HistoryConfig {
+    /// Minutes before `transient` turns (errors, status updates) expire from context.
+    #[serde(default = "default_transient_ttl_mins")]
+    pub transient_ttl_mins: u64,
+    /// Minutes before `tool_noise` turns (verbose tool output) expire from context.
+    #[serde(default = "default_tool_noise_ttl_mins")]
+    pub tool_noise_ttl_mins: u64,
+}
+
+impl Default for HistoryConfig {
+    fn default() -> Self {
+        Self {
+            transient_ttl_mins: default_transient_ttl_mins(),
+            tool_noise_ttl_mins: default_tool_noise_ttl_mins(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

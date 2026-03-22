@@ -40,6 +40,8 @@ pub struct StoredTurn {
     pub tool_log: Vec<ToolLogEntry>,
     /// Structured content blocks for tool_use/tool_result messages (None for plain text turns)
     pub content_blocks: Option<Vec<ContentBlock>>,
+    /// Turn category: "conversation", "transient", or "tool_noise".
+    pub category: String,
 }
 
 impl ConversationStore {
@@ -101,6 +103,21 @@ impl ConversationStore {
                     "ALTER TABLE conversation_turns ADD COLUMN content_blocks VARCHAR;",
                 )?;
             }
+            // Migration: add category column for turn classification (conversation/transient/tool_noise).
+            let has_category: bool = {
+                let mut stmt = conn.prepare(
+                    "SELECT COUNT(*) FROM information_schema.columns \
+                     WHERE table_name = 'conversation_turns' AND column_name = 'category'",
+                )?;
+                let count: i64 = stmt.query_row([], |row| row.get(0))?;
+                count > 0
+            };
+            if !has_category {
+                conn.execute_batch(
+                    "ALTER TABLE conversation_turns ADD COLUMN category VARCHAR; \
+                     UPDATE conversation_turns SET category = 'conversation' WHERE category IS NULL;",
+                )?;
+            }
         }
         Ok(Self { db })
     }
@@ -116,6 +133,7 @@ impl ConversationStore {
         channel: &str,
         tool_log: &[ToolLogEntry],
         content_blocks: Option<&[ContentBlock]>,
+        category: &str,
     ) -> Result<()> {
         let ts = chrono::Utc::now().timestamp_millis();
         let tool_log_json = if tool_log.is_empty() {
@@ -127,11 +145,11 @@ impl ConversationStore {
         let conn = self.db.lock().unwrap();
         conn.execute(
             "INSERT INTO conversation_turns \
-             (session_id, sender, role, content, timestamp_ms, channel, tool_log, content_blocks) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            duckdb::params![session_id, sender, role, content, ts, channel, tool_log_json, blocks_json],
+             (session_id, sender, role, content, timestamp_ms, channel, tool_log, content_blocks, category) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            duckdb::params![session_id, sender, role, content, ts, channel, tool_log_json, blocks_json, category],
         )?;
-        debug!("Stored {role} turn for session {session_id} via {channel}");
+        debug!("Stored {role} turn for session {session_id} via {channel} [category={category}]");
         Ok(())
     }
 
@@ -139,7 +157,7 @@ impl ConversationStore {
     pub fn load_recent(&self, session_id: &str, limit: usize) -> Result<Vec<StoredTurn>> {
         let conn = self.db.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT session_id, sender, role, content, timestamp_ms, COALESCE(channel, 'tui'), tool_log, content_blocks
+            "SELECT session_id, sender, role, content, timestamp_ms, COALESCE(channel, 'tui'), tool_log, content_blocks, COALESCE(category, 'conversation')
              FROM conversation_turns
              WHERE session_id = ?
              ORDER BY timestamp_ms DESC
@@ -161,8 +179,68 @@ impl ConversationStore {
                         .unwrap_or_default(),
                     content_blocks: blocks_json
                         .and_then(|j| serde_json::from_str(&j).ok()),
+                    category:     row.get(8)?,
                 })
             })?
+            .collect::<duckdb::Result<Vec<_>>>()?;
+        // Loaded DESC; reverse to chronological order.
+        turns.reverse();
+        Ok(turns)
+    }
+
+    /// Load recent turns with TTL-based filtering by category.
+    ///
+    /// - `conversation` turns are always included (up to `limit`).
+    /// - `transient` turns are included only if younger than `transient_ttl_mins`.
+    /// - `tool_noise` turns are included only if younger than `tool_noise_ttl_mins`.
+    ///
+    /// Returns results in chronological order (oldest first).
+    pub fn load_recent_filtered(
+        &self,
+        session_id: &str,
+        limit: usize,
+        transient_ttl_mins: u64,
+        tool_noise_ttl_mins: u64,
+    ) -> Result<Vec<StoredTurn>> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let transient_cutoff_ms = now_ms - (transient_ttl_mins as i64 * 60 * 1000);
+        let tool_noise_cutoff_ms = now_ms - (tool_noise_ttl_mins as i64 * 60 * 1000);
+
+        let conn = self.db.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT session_id, sender, role, content, timestamp_ms, COALESCE(channel, 'tui'), tool_log, content_blocks, COALESCE(category, 'conversation')
+             FROM conversation_turns
+             WHERE session_id = ?
+               AND (
+                   COALESCE(category, 'conversation') = 'conversation'
+                   OR (COALESCE(category, 'conversation') = 'transient' AND timestamp_ms >= ?)
+                   OR (COALESCE(category, 'conversation') = 'tool_noise' AND timestamp_ms >= ?)
+               )
+             ORDER BY timestamp_ms DESC
+             LIMIT ?",
+        )?;
+        let mut turns: Vec<StoredTurn> = stmt
+            .query_map(
+                duckdb::params![session_id, transient_cutoff_ms, tool_noise_cutoff_ms, limit as i64],
+                |row| {
+                    let tool_log_json: Option<String> = row.get(6)?;
+                    let blocks_json: Option<String> = row.get(7)?;
+                    Ok(StoredTurn {
+                        session_id:   row.get(0)?,
+                        sender:       row.get(1)?,
+                        role:         row.get(2)?,
+                        content:      row.get(3)?,
+                        timestamp_ms: row.get(4)?,
+                        channel:      row.get(5)?,
+                        tool_log: tool_log_json
+                            .and_then(|j| serde_json::from_str(&j).ok())
+                            .unwrap_or_default(),
+                        content_blocks: blocks_json
+                            .and_then(|j| serde_json::from_str(&j).ok()),
+                        category:     row.get(8)?,
+                    })
+                },
+            )?
             .collect::<duckdb::Result<Vec<_>>>()?;
         // Loaded DESC; reverse to chronological order.
         turns.reverse();

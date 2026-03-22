@@ -39,6 +39,7 @@ fn test_config() -> AppConfig {
         heartbeat: HeartbeatConfig { interval_secs: 3600 },
         poll_interval_secs: 0,
         signal: None,
+        history: Default::default(),
     }
 }
 

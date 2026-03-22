@@ -142,7 +142,8 @@ impl Agent {
             let mut ctx = self.context.write().await;
             ctx.push(Role::User, ctx_text);
         }
-        if let Err(e) = self.conv_store.push("default", sender, "user", text, channel, &[], None) {
+        let user_category = if sender == "system" { "transient" } else { "conversation" };
+        if let Err(e) = self.conv_store.push("default", sender, "user", text, channel, &[], None, user_category) {
             warn!("Failed to persist user turn: {e:#}");
         }
 
@@ -253,15 +254,16 @@ impl Agent {
                 .collect::<Vec<_>>()
                 .join("\n");
             let sender = if role_str == "user" { "system" } else { "assistant" };
+            // Intermediate tool loop turns (tool_use and tool_result) are tool_noise.
             if let Err(e) = self.conv_store.push(
-                "default", sender, role_str, &text_summary, channel, &[], Some(blocks),
+                "default", sender, role_str, &text_summary, channel, &[], Some(blocks), "tool_noise",
             ) {
                 warn!("Failed to persist intermediate tool turn: {e:#}");
             }
         }
         // Persist final assistant text
         if let Err(e) = self.conv_store.push(
-            "default", "assistant", "assistant", &clean_text, channel, &tool_log, None,
+            "default", "assistant", "assistant", &clean_text, channel, &tool_log, None, "conversation",
         ) {
             warn!("Failed to persist assistant turn: {e:#}");
         }
@@ -377,7 +379,7 @@ impl Agent {
              - **Complex analysis**: chain sub-agents where each step builds on the previous using `plan_subagents`.\n\
              - Sub-agents run in the BACKGROUND — you stay responsive to the user.\n\
              - The user can see live sub-agent activity in TUI activity boxes.\n\
-             - When a sub-agent finishes, you receive a compact notification with a brief excerpt. Synthesise the result in your own words — never quote the raw sub-agent output verbatim into chat. Report what the user needs to know, concisely, as if you are briefing them on what your colleague found.\n\
+             - When a sub-agent finishes, you receive its result. If the result contains generated content the user asked for (tables, code, text, etc.), pass it through directly — do not summarize or describe content the user wanted produced. For research or status results, brief the user concisely in your own words.\n\
              - Use `spawn_subagent` for simple one-off delegations.\n\
              - Use `plan_subagents` for complex workflows with dependencies.\n\
              - Use `list_subagents` to check on running sub-agents.\n\
@@ -868,6 +870,7 @@ mod tests {
             heartbeat: HeartbeatConfig { interval_secs: 3600 },
             poll_interval_secs: 0,
             signal: None,
+            history: Default::default(),
         }
     }
 
