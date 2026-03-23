@@ -157,6 +157,7 @@ pub fn run_tui(
     let mut h_scroll: usize = 0; // chars scrolled right on nowrap (table/code) lines
     let mut tool_status: Option<String> = None;
     let mut sa_boxes: Vec<SubAgentBox> = Vec::new();
+    let mut input_scroll_top: u16 = 0; // tracks textarea viewport top row
     // System clipboard — may be unavailable in headless/Wayland-without-display environments.
     let mut clipboard = Clipboard::new().ok();
 
@@ -307,7 +308,226 @@ pub fn run_tui(
             }
         }
 
-        // True when we are awaiting an agent response.
+        // ── Input events ─────────────────────────────────────────────────────
+        // Process events *before* drawing so the frame reflects the latest
+        // state (e.g. deleted newlines shrink the input area immediately).
+        let waiting_for_events = messages.last().map(|m| m.streaming).unwrap_or(false);
+        if event::poll(Duration::from_millis(16)).unwrap_or(false) {
+            match event::read() {
+                Ok(Event::Key(key)) => {
+                    use crossterm::event::KeyEventKind;
+                    if key.kind != KeyEventKind::Release {
+                        match key.code {
+                            KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                cleanup(&mut terminal);
+                                std::process::exit(0);
+                            }
+                            KeyCode::PageUp => {
+                                auto_scroll = false;
+                                scroll_up = scroll_up.saturating_add(10);
+                            }
+                            KeyCode::PageDown => {
+                                scroll_up = scroll_up.saturating_sub(10);
+                                if scroll_up == 0 {
+                                    auto_scroll = true;
+                                    h_scroll = 0;
+                                }
+                            }
+                            KeyCode::Left
+                                if key.modifiers.contains(KeyModifiers::SHIFT)
+                                    && (waiting_for_events || scroll_up > 0 || h_scroll > 0) =>
+                            {
+                                h_scroll = h_scroll.saturating_sub(8);
+                            }
+                            KeyCode::Right
+                                if key.modifiers.contains(KeyModifiers::SHIFT)
+                                    && (waiting_for_events || scroll_up > 0 || h_scroll > 0) =>
+                            {
+                                h_scroll += 8;
+                            }
+                            KeyCode::Enter
+                                if !key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+                                    && !waiting_for_events =>
+                            {
+                                let text = textarea.lines().join("\n");
+                                let text = text.trim().to_string();
+                                if !text.is_empty() {
+                                    messages.push(ChatMessage {
+                                        role: "You".to_string(),
+                                        text: text.clone(),
+                                        streaming: false,
+                                        collapsed: false,
+                                    });
+                                    messages.push(ChatMessage {
+                                        role: agent_name.clone(),
+                                        text: String::new(),
+                                        streaming: true,
+                                        collapsed: false,
+                                    });
+                                    user_input_tx.blocking_send(text).ok();
+                                    textarea = make_textarea();
+                                    input_scroll_top = 0;
+                                    auto_scroll = true;
+                                    scroll_up = 0;
+                                    h_scroll = 0;
+                                }
+                            }
+                            KeyCode::Char('c')
+                                if key.modifiers.contains(KeyModifiers::CONTROL) && !waiting_for_events =>
+                            {
+                                textarea.copy();
+                                let yanked = textarea.yank_text().to_string();
+                                if !yanked.is_empty() {
+                                    if let Some(ref mut cb) = clipboard {
+                                        let _ = cb.set_text(yanked);
+                                    }
+                                }
+                            }
+                            KeyCode::Char('x')
+                                if key.modifiers.contains(KeyModifiers::CONTROL) && !waiting_for_events =>
+                            {
+                                textarea.cut();
+                                let yanked = textarea.yank_text().to_string();
+                                if !yanked.is_empty() {
+                                    if let Some(ref mut cb) = clipboard {
+                                        let _ = cb.set_text(yanked);
+                                    }
+                                }
+                            }
+                            KeyCode::Char('v')
+                                if key.modifiers.contains(KeyModifiers::CONTROL) && !waiting_for_events =>
+                            {
+                                if let Some(ref mut cb) = clipboard {
+                                    if let Ok(text) = cb.get_text() {
+                                        textarea.set_yank_text(text);
+                                        textarea.paste();
+                                    }
+                                }
+                            }
+                            _ if !waiting_for_events => {
+                                textarea.input(key);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Ok(Event::Mouse(mouse)) => match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        auto_scroll = false;
+                        scroll_up = scroll_up.saturating_add(3);
+                    }
+                    MouseEventKind::ScrollDown => {
+                        scroll_up = scroll_up.saturating_sub(3);
+                        if scroll_up == 0 {
+                            auto_scroll = true;
+                        }
+                    }
+                    MouseEventKind::ScrollLeft => {
+                        h_scroll = h_scroll.saturating_sub(3);
+                    }
+                    MouseEventKind::ScrollRight => {
+                        h_scroll += 3;
+                    }
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if in_chat_content(mouse.column, mouse.row, last_chat_area) {
+                            let row = content_row(mouse.row, last_chat_area, last_scroll_top);
+                            let col = content_col(mouse.column, last_chat_area);
+                            let row_idx = row as usize;
+                            let mut toggled_sys = false;
+                            if let Some(&msg_idx) = last_row_to_msg.get(row_idx) {
+                                if messages[msg_idx].role == "System" {
+                                    messages[msg_idx].collapsed = !messages[msg_idx].collapsed;
+                                    sel_start = None;
+                                    sel_end = None;
+                                    is_selecting = false;
+                                    toggled_sys = true;
+                                }
+                            }
+                            if !toggled_sys {
+                                sel_start = Some((row, col));
+                                sel_end = Some((row, col));
+                                is_selecting = true;
+                            }
+                        } else {
+                            sel_start = None;
+                            sel_end = None;
+                            is_selecting = false;
+                        }
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) if is_selecting => {
+                        if last_chat_area.height > 2 {
+                            let top_content = last_chat_area.y + 1;
+                            let bot_content = last_chat_area.y + last_chat_area.height - 2;
+                            let left_content = last_chat_area.x + 1;
+                            let right_content =
+                                last_chat_area.x + last_chat_area.width.saturating_sub(2);
+                            let clamped_row = mouse.row.clamp(top_content, bot_content);
+                            let row = content_row(clamped_row, last_chat_area, last_scroll_top);
+                            let col = content_col(mouse.column, last_chat_area);
+                            sel_end = Some((row, col));
+                            const SCROLLOFF: u16 = 2;
+                            if mouse.row <= top_content + SCROLLOFF {
+                                auto_scroll = false;
+                                scroll_up = scroll_up.saturating_add(1);
+                            } else if mouse.row >= bot_content.saturating_sub(SCROLLOFF) {
+                                scroll_up = scroll_up.saturating_sub(1);
+                                if scroll_up == 0 {
+                                    auto_scroll = true;
+                                }
+                            }
+                            const H_SCROLLOFF: u16 = 3;
+                            if mouse.column <= left_content + H_SCROLLOFF {
+                                h_scroll = h_scroll.saturating_sub(2);
+                            } else if mouse.column >= right_content.saturating_sub(H_SCROLLOFF) {
+                                h_scroll += 2;
+                            }
+                        }
+                    }
+                    MouseEventKind::Up(MouseButton::Left) if is_selecting => {
+                        is_selecting = false;
+                        if let (Some(s), Some(e)) = (sel_start, sel_end) {
+                            let (s, e) = if s <= e { (s, e) } else { (e, s) };
+                            if s != e {
+                                let (tagged, _) = build_chat_lines(&messages);
+                                let (lines, soft_wraps, full_lines, is_nowrap_row) =
+                                    build_display_lines(&tagged, last_inner_width);
+                                let _ = lines;
+                                let text = extract_selected_text(
+                                    &full_lines, &soft_wraps, &is_nowrap_row, s, e,
+                                );
+                                if !text.is_empty() {
+                                    if let Some(ref mut cb) = clipboard {
+                                        let _ = cb.set_text(text);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+                Ok(Event::Resize(_, _)) => {}
+                _ => {}
+            }
+        }
+
+        // Clamp the textarea's internal viewport so it doesn't leave blank
+        // space at the bottom when lines are deleted.  textarea.scroll()
+        // adjusts the viewport *and* moves the cursor, so we save/restore it.
+        {
+            let total_lines = textarea.lines().len() as u16;
+            let (cur_row, cur_col) = textarea.cursor();
+            // Scroll to the very top — this resets the viewport's prev_top to
+            // 0 (via next_scroll_top seeing cursor < prev_top).  Then Jump
+            // restores the cursor; the next render will recompute prev_top
+            // correctly from 0, clamping to show no blank trailing rows.
+            if total_lines > 0 {
+                let big = -(total_lines as i16);
+                textarea.scroll((big, 0i16));
+                textarea.move_cursor(tui_textarea::CursorMove::Jump(cur_row as u16, cur_col as u16));
+            }
+        }
+
+        // Recompute after event processing so the draw reflects current state.
         let waiting = messages.last().map(|m| m.streaming).unwrap_or(false);
 
         // Update textarea decoration to reflect waiting/tool state.
@@ -479,12 +699,21 @@ pub fn run_tui(
 
                 frame.render_widget(&textarea, input_area);
 
-                // Render persistent ">" prompt in the left padding area.
-                // The textarea block has left padding of 2, so column +1
-                // places the ">" just before the text content starts.
-                let prompt_x = input_area.x + 1; // after border (none) / start
-                let prompt_y = input_area.y + 1; // after top border
-                if prompt_y < input_area.bottom().saturating_sub(1) {
+                // Render persistent "❯" prompt aligned with the first line
+                // of input. Hide it when the textarea has scrolled past line 0.
+                // Since we reset the viewport to 0 before each render,
+                // next_scroll_top(0, cursor, height) simplifies to this:
+                let visible_rows = input_area.height.saturating_sub(2); // minus borders
+                let (cursor_row, _) = textarea.cursor();
+                let cursor_row = cursor_row as u16;
+                input_scroll_top = if visible_rows > 0 && cursor_row >= visible_rows {
+                    cursor_row + 1 - visible_rows
+                } else {
+                    0
+                };
+                if input_scroll_top == 0 && visible_rows > 0 {
+                    let prompt_x = input_area.x + 1;
+                    let prompt_y = input_area.y + 1; // after top border
                     frame.render_widget(
                         Paragraph::new(Span::styled("❯ ", Style::default().fg(SAGE_DIM))),
                         ratatui::layout::Rect::new(prompt_x, prompt_y, 2, 1),
@@ -519,247 +748,6 @@ pub fn run_tui(
             })
             .ok();
 
-        // ── Input events (~60 fps) ────────────────────────────────────────────
-        if !event::poll(Duration::from_millis(16)).unwrap_or(false) {
-            continue;
-        }
-
-        match event::read() {
-            Ok(Event::Key(key)) => {
-                use crossterm::event::KeyEventKind;
-                // Only process press and repeat; ignore release events.
-                if key.kind == KeyEventKind::Release {
-                    continue;
-                }
-
-                match key.code {
-                    // ── Ctrl+Q — quit ─────────────────────────────────────────
-                    KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        cleanup(&mut terminal);
-                        std::process::exit(0);
-                    }
-
-                    // ── Page Up / Down — vertical scroll ──────────────────────
-                    KeyCode::PageUp => {
-                        auto_scroll = false;
-                        scroll_up = scroll_up.saturating_add(10);
-                    }
-                    KeyCode::PageDown => {
-                        scroll_up = scroll_up.saturating_sub(10);
-                        if scroll_up == 0 {
-                            auto_scroll = true;
-                            h_scroll = 0;
-                        }
-                    }
-
-                    // ── Shift+Left / Right — horizontal scroll (tables/code) ───
-                    // Active when waiting, reviewing history, or already scrolled.
-                    // Falls through to the textarea otherwise (text selection).
-                    KeyCode::Left
-                        if key.modifiers.contains(KeyModifiers::SHIFT)
-                            && (waiting || scroll_up > 0 || h_scroll > 0) =>
-                    {
-                        h_scroll = h_scroll.saturating_sub(8);
-                    }
-                    KeyCode::Right
-                        if key.modifiers.contains(KeyModifiers::SHIFT)
-                            && (waiting || scroll_up > 0 || h_scroll > 0) =>
-                    {
-                        h_scroll += 8;
-                    }
-
-                    // ── Enter (no Shift / Alt) — submit message ───────────────
-                    KeyCode::Enter
-                        if !key
-                            .modifiers
-                            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
-                            && !waiting =>
-                    {
-                        let text = textarea.lines().join("\n");
-                        let text = text.trim().to_string();
-                        if !text.is_empty() {
-                            // Add user message to history.
-                            messages.push(ChatMessage {
-                                role: "You".to_string(),
-                                text: text.clone(),
-                                streaming: false,
-                                collapsed: false,
-                            });
-                            // Placeholder for the agent response.
-                            messages.push(ChatMessage {
-                                role: agent_name.clone(),
-                                text: String::new(),
-                                streaming: true,
-                                collapsed: false,
-                            });
-                            user_input_tx.blocking_send(text).ok();
-                            textarea = make_textarea();
-                            auto_scroll = true;
-                            scroll_up = 0;
-                            h_scroll = 0;
-                        }
-                    }
-
-                    // ── Ctrl+C — copy selection to system clipboard ───────────
-                    KeyCode::Char('c')
-                        if key.modifiers.contains(KeyModifiers::CONTROL) && !waiting =>
-                    {
-                        textarea.copy();
-                        let yanked = textarea.yank_text().to_string();
-                        if !yanked.is_empty() {
-                            if let Some(ref mut cb) = clipboard {
-                                let _ = cb.set_text(yanked);
-                            }
-                        }
-                    }
-
-                    // ── Ctrl+X — cut selection to system clipboard ────────────
-                    KeyCode::Char('x')
-                        if key.modifiers.contains(KeyModifiers::CONTROL) && !waiting =>
-                    {
-                        textarea.cut();
-                        let yanked = textarea.yank_text().to_string();
-                        if !yanked.is_empty() {
-                            if let Some(ref mut cb) = clipboard {
-                                let _ = cb.set_text(yanked);
-                            }
-                        }
-                    }
-
-                    // ── Ctrl+V — paste from system clipboard ──────────────────
-                    KeyCode::Char('v')
-                        if key.modifiers.contains(KeyModifiers::CONTROL) && !waiting =>
-                    {
-                        if let Some(ref mut cb) = clipboard {
-                            if let Ok(text) = cb.get_text() {
-                                textarea.set_yank_text(text);
-                                textarea.paste();
-                            }
-                        }
-                    }
-
-                    // ── All other keys → textarea ─────────────────────────────
-                    // Includes Shift+Enter (newline) and regular typing.
-                    _ if !waiting => {
-                        textarea.input(key);
-                    }
-
-                    _ => {}
-                }
-            }
-
-            Ok(Event::Mouse(mouse)) => match mouse.kind {
-                // ── Scroll wheel / trackpad ───────────────────────────────────
-                MouseEventKind::ScrollUp => {
-                    auto_scroll = false;
-                    scroll_up = scroll_up.saturating_add(3);
-                }
-                MouseEventKind::ScrollDown => {
-                    scroll_up = scroll_up.saturating_sub(3);
-                    if scroll_up == 0 {
-                        auto_scroll = true;
-                    }
-                }
-                MouseEventKind::ScrollLeft => {
-                    h_scroll = h_scroll.saturating_sub(3);
-                }
-                MouseEventKind::ScrollRight => {
-                    h_scroll += 3;
-                }
-
-                // ── Left-button drag — character-level text selection ─────────
-                MouseEventKind::Down(MouseButton::Left) => {
-                    if in_chat_content(mouse.column, mouse.row, last_chat_area) {
-                        let row = content_row(mouse.row, last_chat_area, last_scroll_top);
-                        let col = content_col(mouse.column, last_chat_area);
-
-                        // Check if clicking on a system message toggle.
-                        let row_idx = row as usize;
-                        if let Some(&msg_idx) = last_row_to_msg.get(row_idx) {
-                            if messages[msg_idx].role == "System" {
-                                messages[msg_idx].collapsed = !messages[msg_idx].collapsed;
-                                sel_start = None;
-                                sel_end = None;
-                                is_selecting = false;
-                                continue;
-                            }
-                        }
-
-                        sel_start = Some((row, col));
-                        sel_end = Some((row, col));
-                        is_selecting = true;
-                    } else {
-                        // Click outside chat area clears any active selection.
-                        sel_start = None;
-                        sel_end = None;
-                        is_selecting = false;
-                    }
-                }
-
-                MouseEventKind::Drag(MouseButton::Left) if is_selecting => {
-                    if last_chat_area.height > 2 {
-                        let top_content = last_chat_area.y + 1;
-                        let bot_content = last_chat_area.y + last_chat_area.height - 2;
-                        let left_content = last_chat_area.x + 1;
-                        let right_content =
-                            last_chat_area.x + last_chat_area.width.saturating_sub(2);
-                        // Clamp to the visible content rows and update selection end.
-                        let clamped_row = mouse.row.clamp(top_content, bot_content);
-                        let row = content_row(clamped_row, last_chat_area, last_scroll_top);
-                        let col = content_col(mouse.column, last_chat_area);
-                        sel_end = Some((row, col));
-
-                        // Vertical scrolloff: autoscroll when dragging near top / bottom.
-                        const SCROLLOFF: u16 = 2;
-                        if mouse.row <= top_content + SCROLLOFF {
-                            auto_scroll = false;
-                            scroll_up = scroll_up.saturating_add(1);
-                        } else if mouse.row >= bot_content.saturating_sub(SCROLLOFF) {
-                            scroll_up = scroll_up.saturating_sub(1);
-                            if scroll_up == 0 {
-                                auto_scroll = true;
-                            }
-                        }
-
-                        // Horizontal scrolloff: scroll nowrap content when dragging
-                        // near the left / right edge of the chat pane.
-                        const H_SCROLLOFF: u16 = 3;
-                        if mouse.column <= left_content + H_SCROLLOFF {
-                            h_scroll = h_scroll.saturating_sub(2);
-                        } else if mouse.column >= right_content.saturating_sub(H_SCROLLOFF) {
-                            h_scroll += 2;
-                        }
-                    }
-                }
-
-                MouseEventKind::Up(MouseButton::Left) if is_selecting => {
-                    is_selecting = false;
-                    // Copy selected text to the system clipboard on release.
-                    if let (Some(s), Some(e)) = (sel_start, sel_end) {
-                        let (s, e) = if s <= e { (s, e) } else { (e, s) };
-                        if s != e {
-                            let (tagged, _) = build_chat_lines(&messages);
-                            let (lines, soft_wraps, full_lines, is_nowrap_row) =
-                                build_display_lines(&tagged, last_inner_width);
-                            let _ = lines; // display lines not needed here
-                            let text = extract_selected_text(
-                                &full_lines, &soft_wraps, &is_nowrap_row, s, e,
-                            );
-                            if !text.is_empty() {
-                                if let Some(ref mut cb) = clipboard {
-                                    let _ = cb.set_text(text);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                _ => {}
-            },
-
-            Ok(Event::Resize(_, _)) => {} // redrawn on next iteration
-            _ => {}
-        }
     }
 }
 
