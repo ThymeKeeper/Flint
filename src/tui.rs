@@ -317,15 +317,15 @@ pub fn run_tui(
             Some(name) => format!(" {} ", name),
             None if waiting && sa_count > 0 => format!(" Waiting… ({sa_count} sub-agents) "),
             None if waiting => " Waiting… ".to_string(),
-            None if sa_count > 0 => format!(" You  ({sa_count} sub-agents) "),
-            None => " You ".to_string(),
+            None if sa_count > 0 => format!(" {sa_count} sub-agents "),
+            None => String::new(),
         };
         let input_style = if waiting {
             Style::default().fg(SAGE_DIM)
         } else {
             Style::default()
         };
-        textarea.set_block(Block::default().borders(Borders::TOP | Borders::BOTTOM).padding(Padding::horizontal(1)).title(input_title.clone()));
+        textarea.set_block(Block::default().borders(Borders::TOP | Borders::BOTTOM).padding(Padding::new(3, 1, 0, 0)).title(input_title.clone()));
         textarea.set_style(input_style);
 
         // ── Draw ─────────────────────────────────────────────────────────────
@@ -353,11 +353,13 @@ pub fn run_tui(
                         Constraint::Min(3),
                         Constraint::Length(sa_panel_height),
                         Constraint::Length(input_height),
+                        Constraint::Length(1), // status bar
                     ]
                 } else {
                     vec![
                         Constraint::Min(3),
                         Constraint::Length(input_height),
+                        Constraint::Length(1), // status bar
                     ]
                 };
 
@@ -366,9 +368,11 @@ pub fn run_tui(
                     .constraints(constraints)
                     .split(area);
 
-                let chat_area = if sa_panel_height > 0 { chunks[0] } else { chunks[0] };
-                let sa_area = if sa_panel_height > 0 { Some(chunks[1]) } else { None };
-                let input_area = if sa_panel_height > 0 { chunks[2] } else { chunks[1] };
+                let (chat_area, sa_area, input_area, status_area) = if sa_panel_height > 0 {
+                    (chunks[0], Some(chunks[1]), chunks[2], chunks[3])
+                } else {
+                    (chunks[0], None, chunks[1], chunks[2])
+                };
 
                 let inner_width = chat_area.width.saturating_sub(1); // right padding only
                 let (tagged, tagged_msg_idx) = build_chat_lines(&messages);
@@ -460,7 +464,7 @@ pub fn run_tui(
 
                 let chat_title = format!(" {} ", agent_name);
                 let chat_block = Block::default()
-                    .borders(Borders::TOP | Borders::BOTTOM)
+                    .borders(Borders::TOP)
                     .padding(Padding::right(1))
                     .title(chat_title);
                 // No .wrap() — lines are already pre-wrapped.
@@ -474,6 +478,44 @@ pub fn run_tui(
                 }
 
                 frame.render_widget(&textarea, input_area);
+
+                // Render persistent ">" prompt in the left padding area.
+                // The textarea block has left padding of 2, so column +1
+                // places the ">" just before the text content starts.
+                let prompt_x = input_area.x + 1; // after border (none) / start
+                let prompt_y = input_area.y + 1; // after top border
+                if prompt_y < input_area.bottom().saturating_sub(1) {
+                    frame.render_widget(
+                        Paragraph::new(Span::styled("❯ ", Style::default().fg(SAGE_DIM))),
+                        ratatui::layout::Rect::new(prompt_x, prompt_y, 2, 1),
+                    );
+                }
+
+                // ── Status bar ────────────────────────────────────────────────
+                let status_left = Span::styled(
+                    format!(" {}", agent_name),
+                    Style::default().fg(SAGE_DIM),
+                );
+                let status_right = match &tool_status {
+                    Some(name) => Span::styled(
+                        format!("{} ", name),
+                        Style::default().fg(SAGE_YELLOW),
+                    ),
+                    None if waiting => Span::styled(
+                        "thinking… ".to_string(),
+                        Style::default().fg(SAGE_DIM),
+                    ),
+                    None => Span::raw(""),
+                };
+                let status_bar = Line::from(vec![
+                    status_left,
+                    Span::raw(" "),
+                    status_right,
+                ]);
+                frame.render_widget(
+                    Paragraph::new(status_bar),
+                    status_area,
+                );
             })
             .ok();
 
@@ -817,7 +859,7 @@ fn trunc_str(s: &str, max: usize) -> String {
 
 fn make_textarea<'a>() -> TextArea<'a> {
     let mut ta = TextArea::default();
-    ta.set_block(Block::default().borders(Borders::TOP | Borders::BOTTOM).padding(Padding::horizontal(1)).title(" You "));
+    ta.set_block(Block::default().borders(Borders::TOP | Borders::BOTTOM).padding(Padding::new(3, 1, 0, 0)));
     ta.set_cursor_line_style(Style::default()); // no background on cursor row
     ta
 }
