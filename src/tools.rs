@@ -112,6 +112,11 @@ pub async fn execute_tool(name: &str, input: &Value) -> String {
 // Tool implementations
 // ---------------------------------------------------------------------------
 
+/// Extract a path field from tool input, accepting both "path" and "file_path".
+fn extract_path(input: &Value) -> Option<&str> {
+    input["path"].as_str().or_else(|| input["file_path"].as_str())
+}
+
 async fn shell_exec(input: &Value) -> String {
     let command = match input["command"].as_str() {
         Some(c) => c,
@@ -153,7 +158,7 @@ async fn shell_exec(input: &Value) -> String {
 }
 
 fn file_read(input: &Value) -> String {
-    let path = match input["path"].as_str() {
+    let path = match extract_path(input) {
         Some(p) => p,
         None => return "Error: missing 'path' field".to_string(),
     };
@@ -172,7 +177,7 @@ fn file_read(input: &Value) -> String {
 }
 
 fn file_write(input: &Value) -> String {
-    let path = match input["path"].as_str() {
+    let path = match extract_path(input) {
         Some(p) => p,
         None => return "Error: missing 'path' field".to_string(),
     };
@@ -712,8 +717,8 @@ pub fn format_tool_call(name: &str, input: &Value) -> String {
                 cmd
             }
         }
-        "file_read"      => input["path"].as_str().unwrap_or("").to_string(),
-        "file_write"     => input["path"].as_str().unwrap_or("").to_string(),
+        "file_read"      => extract_path(input).unwrap_or("").to_string(),
+        "file_write"     => extract_path(input).unwrap_or("").to_string(),
         "web_fetch"      => trunc(input["url"].as_str().unwrap_or(""), 72),
         "memory_search"  => trunc(input["query"].as_str().unwrap_or(""), 60),
         "memory_store"   => trunc(input["title"].as_str().unwrap_or(""), 60),
@@ -727,10 +732,10 @@ pub fn format_tool_call(name: &str, input: &Value) -> String {
         "update_skill"   => input["id"].as_str().unwrap_or("").to_string(),
         "delete_skill"   => input["id"].as_str().unwrap_or("").to_string(),
         "signal_send"    => trunc(input["message"].as_str().unwrap_or(""), 60),
-        "code_symbols"         => input["path"].as_str().unwrap_or("").to_string(),
-        "code_goto_definition" => format!("{}:{}:{}", input["path"].as_str().unwrap_or(""), input["line"], input["column"]),
+        "code_symbols"         => extract_path(input).unwrap_or("").to_string(),
+        "code_goto_definition" => format!("{}:{}:{}", extract_path(input).unwrap_or(""), input["line"], input["column"]),
         "code_find_references" => format!("{} in {}", input["symbol"].as_str().unwrap_or(""), input["directory"].as_str().unwrap_or("")),
-        "code_diagnostics"     => input["path"].as_str().unwrap_or("").to_string(),
+        "code_diagnostics"     => extract_path(input).unwrap_or("").to_string(),
         "plan_subagents"       => {
             let n = input["steps"].as_array().map(|a| a.len()).unwrap_or(0);
             format!("{n} steps")
@@ -1585,7 +1590,7 @@ impl ToolExecutor {
     // -----------------------------------------------------------------------
 
     fn code_symbols(&self, input: &Value) -> String {
-        let path = match input["path"].as_str() {
+        let path = match extract_path(input) {
             Some(p) => std::path::PathBuf::from(p),
             None => return "Error: missing 'path' field".to_string(),
         };
@@ -1611,7 +1616,7 @@ impl ToolExecutor {
     }
 
     fn code_goto_definition(&self, input: &Value) -> String {
-        let path = match input["path"].as_str() {
+        let path = match extract_path(input) {
             Some(p) => std::path::PathBuf::from(p),
             None => return "Error: missing 'path' field".to_string(),
         };
@@ -1659,7 +1664,7 @@ impl ToolExecutor {
     }
 
     fn code_diagnostics(&self, input: &Value) -> String {
-        let path = match input["path"].as_str() {
+        let path = match extract_path(input) {
             Some(p) => std::path::PathBuf::from(p),
             None => return "Error: missing 'path' field".to_string(),
         };

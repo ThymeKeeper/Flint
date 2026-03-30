@@ -35,6 +35,8 @@ use ratatui::{
 use tokio::sync::mpsc;
 use tui_textarea::TextArea;
 
+use crate::tui_git_diff;
+
 // ---------------------------------------------------------------------------
 // Public channel types
 // ---------------------------------------------------------------------------
@@ -1054,6 +1056,12 @@ fn flush_table(rows: &[String], result: &mut Vec<(Line<'static>, bool)>) {
 fn render_markdown(text: &str) -> Vec<(Line<'static>, bool)> {
     let mut result: Vec<(Line<'static>, bool)> = Vec::new();
     let mut in_code_block = false;
+
+    // ── Git diff detection ─────────────────────────────────────────────
+    if tui_git_diff::is_git_diff(text) {
+        return tui_git_diff::render_git_diff(text);
+    }
+
     let mut table_buf: Vec<String> = Vec::new();
 
     for raw_line in text.lines() {
