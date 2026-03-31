@@ -35,7 +35,7 @@ use ratatui::{
 use tokio::sync::mpsc;
 use tui_textarea::TextArea;
 
-use crate::tui_git_diff;
+use crate::tui_code_blocks;
 
 // ---------------------------------------------------------------------------
 // Public channel types
@@ -1053,48 +1053,49 @@ fn flush_table(rows: &[String], result: &mut Vec<(Line<'static>, bool)>) {
 /// - Tables: columns aligned, pipes removed, header bolded, separator as dim rule
 /// - ATX headers (`#`, `##`, `###`) rendered in color+bold
 /// - Inline `**bold**` and `` `code` `` spans
+/// Convert a message's text to styled ratatui `Line`s with enhanced markdown rendering:
+/// - Fenced code blocks (```) with syntax highlighting
+/// - Tables: columns aligned, pipes removed, header bolded, separator as dim rule
+/// - ATX headers (`#`, `##`, `###`) rendered in color+bold
+/// - Inline `**bold**` and `` `code` `` spans
 fn render_markdown(text: &str) -> Vec<(Line<'static>, bool)> {
     let mut result: Vec<(Line<'static>, bool)> = Vec::new();
-    let mut in_code_block = false;
-
-    // ── Git diff detection ─────────────────────────────────────────────
-    if tui_git_diff::is_git_diff(text) {
-        return tui_git_diff::render_git_diff(text);
-    }
 
     let mut table_buf: Vec<String> = Vec::new();
+    let mut in_code_block = false;
+    let mut current_language: Option<String> = None;
+    let mut code_block_lines: Vec<String> = Vec::new();
 
     for raw_line in text.lines() {
         // ── Code fence toggle ──────────────────────────────────────────────
-        if raw_line.trim_start().starts_with("```") {
+        if tui_code_blocks::is_code_fence(raw_line) {
             if !table_buf.is_empty() {
                 flush_table(&table_buf, &mut result);
                 table_buf.clear();
             }
-            in_code_block = !in_code_block;
-            let lang = raw_line.trim().trim_start_matches('`').trim();
-            let label = if lang.is_empty() {
-                "  ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄".to_string()
+            
+            if !in_code_block {
+                // Starting a code block
+                in_code_block = true;
+                current_language = tui_code_blocks::extract_language(raw_line);
+                code_block_lines.clear();
             } else {
-                format!("  ┄ {lang} ")
-            };
-            // Fence markers are short — normal wrap
-            result.push((
-                Line::from(Span::styled(label, Style::default().fg(SAGE_DIM))),
-                false,
-            ));
+                // Ending a code block - render the accumulated content
+                in_code_block = false;
+                let code_block_render = tui_code_blocks::render_code_block(
+                    &code_block_lines, 
+                    current_language.as_deref()
+                );
+                result.extend(code_block_render);
+                current_language = None;
+                code_block_lines.clear();
+            }
             continue;
         }
 
         if in_code_block {
-            // Code content — no wrap, horizontally scrollable
-            result.push((
-                Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(raw_line.to_string(), Style::default().fg(SAGE_YELLOW)),
-                ]),
-                true,
-            ));
+            // Accumulate code content
+            code_block_lines.push(raw_line.to_string());
             continue;
         }
 
@@ -1159,6 +1160,15 @@ fn render_markdown(text: &str) -> Vec<(Line<'static>, bool)> {
         }
     }
 
+    // Handle any unclosed code block at end of text
+    if in_code_block {
+        let code_block_render = tui_code_blocks::render_code_block(
+            &code_block_lines, 
+            current_language.as_deref()
+        );
+        result.extend(code_block_render);
+    }
+
     // Flush any table that ends at end-of-message
     if !table_buf.is_empty() {
         flush_table(&table_buf, &mut result);
@@ -1166,7 +1176,6 @@ fn render_markdown(text: &str) -> Vec<(Line<'static>, bool)> {
 
     result
 }
-
 /// Returns (tagged_lines, line_to_msg_index) where line_to_msg_index[i] is the
 /// index into `messages` that produced tagged line i.
 fn build_chat_lines(messages: &[ChatMessage]) -> (Vec<(Line<'static>, bool)>, Vec<usize>) {

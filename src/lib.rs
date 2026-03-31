@@ -17,4 +17,4 @@ pub mod subagents;
 pub mod tasks;
 pub mod tools;
 pub mod tui;
-pub mod tui_git_diff;
+pub mod tui_git_diff;pub mod tui_code_blocks;

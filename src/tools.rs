@@ -112,9 +112,14 @@ pub async fn execute_tool(name: &str, input: &Value) -> String {
 // Tool implementations
 // ---------------------------------------------------------------------------
 
-/// Extract a path field from tool input, accepting both "path" and "file_path".
+/// Extract a path field from tool input, accepting common path field names.
 fn extract_path(input: &Value) -> Option<&str> {
-    input["path"].as_str().or_else(|| input["file_path"].as_str())
+    input["path"]
+        .as_str()
+        .or_else(|| input["file_path"].as_str())
+        .or_else(|| input["filepath"].as_str())
+        .or_else(|| input["filename"].as_str())
+        .or_else(|| input["file"].as_str())
 }
 
 async fn shell_exec(input: &Value) -> String {
@@ -160,7 +165,16 @@ async fn shell_exec(input: &Value) -> String {
 fn file_read(input: &Value) -> String {
     let path = match extract_path(input) {
         Some(p) => p,
-        None => return "Error: missing 'path' field".to_string(),
+        None => {
+            let keys: Vec<&str> = input
+                .as_object()
+                .map(|m| m.keys().map(|k| k.as_str()).collect())
+                .unwrap_or_default();
+            return format!(
+                "Error: missing 'path' field. Received keys: [{}]. Use 'path' for the file path.",
+                keys.join(", ")
+            );
+        }
     };
 
     match std::fs::read_to_string(path) {
@@ -179,7 +193,16 @@ fn file_read(input: &Value) -> String {
 fn file_write(input: &Value) -> String {
     let path = match extract_path(input) {
         Some(p) => p,
-        None => return "Error: missing 'path' field".to_string(),
+        None => {
+            let keys: Vec<&str> = input
+                .as_object()
+                .map(|m| m.keys().map(|k| k.as_str()).collect())
+                .unwrap_or_default();
+            return format!(
+                "Error: missing 'path' field. Received keys: [{}]. Use 'path' for the file path.",
+                keys.join(", ")
+            );
+        }
     };
     let content = match input["content"].as_str() {
         Some(c) => c,
